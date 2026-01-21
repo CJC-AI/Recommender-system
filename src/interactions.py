@@ -52,7 +52,7 @@ def aggregate_interactions(df: pd.DataFrame) -> pd.DataFrame:
         last_interaction_ts=("timestamp", "max")
     )
 
-    #Reset the index
+    # Reset the index
     # Grouping moves 'visitorid' and 'itemid' into the index (the row labels).
     # This moves them back into standard columns.
     interactions = interactions.reset_index()
