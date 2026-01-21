@@ -34,18 +34,34 @@ def map_event_weights(df: pd.DataFrame) -> pd.DataFrame:
 def aggregate_interactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregate interactions per (user_id, item_id).
+    
+    Steps:
+    1. Group by visitor and item.
+    2. Sum the weights and find the latest timestamp.
+    3. Reset the index to make it a flat table.
+    4. Rename columns to standard names.
     """
-    interactions = (
-        df.groupby(["visitorid", "itemid"])
-        .agg(
-            interaction_score=("interaction_weight", "sum"),
-            last_interaction_ts=("timestamp", "max"),
-        )
-        .reset_index()
+    
+    # Group rows that have the same visitorid AND itemid
+    grouped_data = df.groupby(["visitorid", "itemid"])
+
+    # Calculate the aggregations
+    # Syntax: new_column_name = ('original_column', 'math_operation')
+    interactions = grouped_data.agg(
+        interaction_score=("interaction_weight", "sum"),
+        last_interaction_ts=("timestamp", "max")
     )
 
-    interactions.rename(columns={"visitorid": "user_id","itemid": "item_id",},
-                        inplace=True,)
+    #Reset the index
+    # Grouping moves 'visitorid' and 'itemid' into the index (the row labels).
+    # This moves them back into standard columns.
+    interactions = interactions.reset_index()
+
+    # Rename columns
+    interactions = interactions.rename(columns={
+        "visitorid": "user_id",
+        "itemid": "item_id"
+    })
 
     return interactions
 
