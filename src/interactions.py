@@ -19,6 +19,8 @@ def load_events(path: str) -> pd.DataFrame:
     Load RetailRocket events dataset.
     """
     df = pd.read_csv(path)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df = df.drop_duplicates()
     return df
 
 
