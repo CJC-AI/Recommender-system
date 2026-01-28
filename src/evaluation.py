@@ -3,13 +3,22 @@ from src.candidate_generation import compute_item_popularity, recommend_top_k
 
 def time_based_split(
         interactions: pd.DataFrame,
-        timestamp_col: str = 'last_interaction_ts',
+        timestamp_col: str = "last_interaction_ts",
         train_ratio: float = 0.8,
 ):
+    """
+    Split interactions by time.
+
+    Train: first `train_ratio` fraction
+    Test: remaining interactions
+    """
     interactions = interactions.sort_values(timestamp_col).reset_index(drop=True)
+
     split_index = int(len(interactions) * train_ratio)
+
     train = interactions.iloc[:split_index].copy()
     test = interactions.iloc[split_index:].copy()
+
     return train, test
 
 def precision_at_k(recommended: list, relevant: set, k: int) -> float:
