@@ -15,22 +15,26 @@ def compute_item_popularity(train_df: pd.DataFrame) -> pd.DataFrame:
 
 def recommend_top_k(
         user_id: int, 
-        train_df: pd.DataFrame,
+        user_history: set, 
+        top_popular_items: list, 
         k: int = 10
 ) -> list:
     """
     Recommend Top-K popular items the user has not interacted with yet.
-    """
-    item_popularity = compute_item_popularity(train_df)
-
-    # Get items the user has already interacted with
-    user_items = train_df.loc[
-        train_df["user_id"] == user_id, "item_id"
-        ].unique()
-
-    # Filter out items the user has already interacted with
-    recommendations = item_popularity[
-        ~item_popularity["item_id"].isin(user_items)
-        ]
     
-    return recommendations["item_id"].head(k).tolist()
+    OPTIMIZATION:
+    Instead of filtering a dataframe (slow), iterate through the
+    pre-sorted list of popular items and pick the first k unseen ones.
+    """
+    recommendations = []
+    
+    for item in top_popular_items:
+        # If user hasn't seen it, add it
+        if item not in user_history:
+            recommendations.append(item)
+        
+        # Stop once we have enough recommendations
+        if len(recommendations) >= k:
+            break
+            
+    return recommendations
