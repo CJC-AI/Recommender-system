@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Set
 from src.candidate_generation import build_cooccurrence_matrix, compute_item_popularity
-from src.evaluation import time_based_split
+from src.ranking.evaluation import time_based_split
 
 
 # -------------------------------------------------------
