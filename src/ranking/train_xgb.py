@@ -8,7 +8,7 @@ import math
 # Configuration
 # -------------------------------------------------------
 TRAINING_DATA_PATH  = "data/processed/training_data.csv"
-MODEL_OUTPUT_PATH   = "models/xgb_ranker.json"
+MODEL_OUTPUT_PATH   = "artifacts/models/xgb_ranker.json"
 
 FEATURE_COLUMNS = [
     "item_similarity_score",

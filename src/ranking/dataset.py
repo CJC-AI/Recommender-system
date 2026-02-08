@@ -1,9 +1,8 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, Set
+from typing import Dict, Set, List
 from src.candidate_generation import build_cooccurrence_matrix, compute_item_popularity
 from src.ranking.evaluation import time_based_split
-
 
 # -------------------------------------------------------
 # Configuration
@@ -37,7 +36,7 @@ def fast_compute_features(
     if user_history_set:
         neighbors = similarity_matrix.get(row_item_id, {})
         if neighbors:
-            # Fast set intersection
+            # Fast set intersection to find overlap between history and item's neighbors
             common_items = user_history_set.intersection(neighbors.keys())
             if common_items:
                 max_sim = max(neighbors[i] for i in common_items)
@@ -53,6 +52,7 @@ def fast_compute_features(
         "item_similarity_score": max_sim,
         "item_popularity": item_popularity_dict.get(row_item_id, 0.0),
         "time_since_last_interaction": max(0.0, time_diff),
+        # Negatives get 0.0 weight to distinguish them from real interactions
         "interaction_type_weight": 0.0 if is_negative else get_interaction_type_weight(row_weight),
         "label": 0 if is_negative else 1
     }
@@ -62,23 +62,31 @@ def fast_compute_features(
 # -------------------------------------------------------
 def build_training_data(
     train_df: pd.DataFrame,
-    sample_users_frac: float = 0.2,    # Sample 20% of users
-    sample_items_top_n: int = 5000,    # Negative samples from top 5k items
-    n_negatives: int = 2,              # 2 negatives per positive
+    sample_users_frac: float = 1.0,  # Use all users by default
+    sample_items_top_n: int = 5000,    
+    n_negatives: int = 6,              # Increased to 6 (range 5-10)
     min_cooccurrence: int = 2,
     seed: int = 42,
 ) -> pd.DataFrame:
+    """
+    Build training data with advanced negative sampling.
     
-    print(f"Building SAMPLING-OPTIMIZED training data...")
+    Negative Strategy:
+    1. Hard Negatives: Items similar to user's history (Candidate Gen output).
+    2. Popular Negatives: High-traffic items.
+    3. Exclusions: Items user interacted with in Past OR Future.
+    """
+    
+    print(f"Building TRAINING data with HARD & POPULAR negatives...")
     rng = np.random.RandomState(seed)
     
-    # Ensure timestamps
+    # --- 1. Pre-processing ---
     train_df = train_df.copy()
     if not pd.api.types.is_datetime64_any_dtype(train_df["last_interaction_ts"]):
-        print("  Converting timestamps to datetime...")
+        print("  Converting timestamps...")
         train_df["last_interaction_ts"] = pd.to_datetime(train_df["last_interaction_ts"])
 
-    # 1. User Sampling
+    # User Sampling
     unique_users = train_df["user_id"].unique()
     sampled_users = rng.choice(
         unique_users, 
@@ -86,18 +94,18 @@ def build_training_data(
         replace=False
     )
     train_df = train_df[train_df["user_id"].isin(set(sampled_users))].sort_values("last_interaction_ts")
-    print(f"  Sampled {len(sampled_users)} users for training.")
+    print(f"  Sampled {len(sampled_users)} users.")
 
-    # 2. Build Artifacts
-    print("  Building similarity matrix & popularity dict...")
+    # --- 2. Build Artifacts ---
+    print("  Building Matrix and Global History...")
     
-    # --- FIX: Use Keyword Argument for min_cooccurrence ---
+    # Similarity Matrix (for Hard Negatives)
     similarity_matrix = build_cooccurrence_matrix(
         interactions=train_df, 
         min_cooccurrence=min_cooccurrence
     )
-    # -----------------------------------------------------
     
+    # Popularity (for Popular Negatives - Proxy for 'up to time t')
     pop_df = compute_item_popularity(train_df)
     item_popularity_dict = pop_df.set_index("item_id")["interaction_score"].to_dict()
     
@@ -105,51 +113,96 @@ def build_training_data(
     max_pop = max(item_popularity_dict.values()) if item_popularity_dict else 1.0
     item_popularity_dict = {k: v / max_pop for k, v in item_popularity_dict.items()}
     
-    # Universe for Negatives
-    top_items_universe = pop_df.head(sample_items_top_n)["item_id"].values
+    # Top N universe for popular sampling
+    popular_items_universe = pop_df.head(sample_items_top_n)["item_id"].values
     
-    # 3. Generate Rows
-    print(f"  Generating rows...")
+    # GLOBAL History (Past + Future) for strict exclusions
+    # We must not sample an item as negative if the user will interact with it later
+    user_global_history = train_df.groupby("user_id")["item_id"].apply(set).to_dict()
+
+    # --- 3. Row Generation ---
+    print(f"  Generating rows (Target: {n_negatives} negatives per positive)...")
     training_data = []
+    
+    # Running state
     user_running_history = {} 
     user_last_ts = {}         
     
+    # Using itertuples for speed
     for row in train_df.itertuples(index=False):
-        # Assumes columns: user_id, item_id, interaction_score, last_interaction_ts
         u_id = row.user_id
         i_id = row.item_id
         score = row.interaction_score
         ts = row.last_interaction_ts
         
-        history = user_running_history.get(u_id, set())
+        # Get State
+        current_history = user_running_history.get(u_id, set())
         last_ts = user_last_ts.get(u_id, pd.NaT)
+        full_history_exclusion = user_global_history.get(u_id, set())
         
-        # Positive
+        # --- A. Positive Sample ---
         pos_row = fast_compute_features(
             u_id, i_id, ts, score, 
-            history, last_ts, 
+            current_history, last_ts, 
             similarity_matrix, item_popularity_dict, 
             is_negative=False
         )
         training_data.append(pos_row)
         
-        # Negatives (Vectorized Sampling)
-        candidates = rng.choice(top_items_universe, size=n_negatives * 2) 
-        neg_count = 0
-        for neg_id in candidates:
-            if neg_count >= n_negatives: break
-            if neg_id == i_id or neg_id in history: continue
+        # --- B. Negative Samples ---
+        selected_negatives = []
+        
+        # Source 1: Hard Negatives (from Candidate Gen / Neighbors)
+        # We look at items similar to what the user has recently seen
+        hard_candidates = set()
+        if current_history:
+            # Sample up to 3 recent items to find neighbors for
+            # (Converting set to list is O(N), but history is usually small)
+            seed_items = rng.choice(list(current_history), size=min(len(current_history), 3), replace=False)
+            
+            for seed in seed_items:
+                neighbors = similarity_matrix.get(seed, {})
+                # Add top neighbors as hard negative candidates
+                if neighbors:
+                    # Sort by similarity and take top 5 per seed
+                    sorted_neighbors = sorted(neighbors, key=neighbors.get, reverse=True)[:5]
+                    hard_candidates.update(sorted_neighbors)
+        
+        # Try to fill half the quota with Hard Negatives
+        hard_quota = n_negatives // 2
+        hard_candidates_list = list(hard_candidates)
+        rng.shuffle(hard_candidates_list)
+        
+        for cand in hard_candidates_list:
+            if len(selected_negatives) >= hard_quota:
+                break
+            # Strict Exclusion: Not in Past, Current, or Future
+            if cand not in full_history_exclusion and cand != i_id:
+                selected_negatives.append(cand)
                 
+        # Source 2: Popular Negatives (Backfill the rest)
+        # We sample more than needed to account for collisions
+        needed = n_negatives - len(selected_negatives)
+        if needed > 0:
+            pop_candidates = rng.choice(popular_items_universe, size=needed * 3)
+            for cand in pop_candidates:
+                if len(selected_negatives) >= n_negatives:
+                    break
+                # Deduplicate and Exclude
+                if cand not in full_history_exclusion and cand != i_id and cand not in selected_negatives:
+                    selected_negatives.append(cand)
+        
+        # --- C. Compute Negative Features ---
+        for neg_id in selected_negatives:
             neg_row = fast_compute_features(
                 u_id, neg_id, ts, 0.0, 
-                history, last_ts, 
+                current_history, last_ts, 
                 similarity_matrix, item_popularity_dict, 
                 is_negative=True
             )
             training_data.append(neg_row)
-            neg_count += 1
             
-        # Update State
+        # --- D. Update State ---
         if u_id not in user_running_history:
             user_running_history[u_id] = set()
         user_running_history[u_id].add(i_id)
@@ -157,32 +210,25 @@ def build_training_data(
 
     df_final = pd.DataFrame(training_data)
     print(f"  Final Dataset: {len(df_final)} rows.")
+    print(f"  Positives: {sum(df_final['label']==1)}")
+    print(f"  Negatives: {sum(df_final['label']==0)}")
     return df_final
 
 
 def save_training_data(training_df: pd.DataFrame, output_path: str):
-    """Save training data to CSV."""
     training_df.to_csv(output_path, index=False)
     print(f"Saved to {output_path}")
 
-
-
-# -------------------------------------------------------
-# CLI ENTRY POINT
-# -------------------------------------------------------
-
 if __name__ == "__main__":
+    # Example usage flow
     INTERACTIONS_PATH = "data/processed/interactions.csv"
     TRAINING_OUTPUT_PATH = "data/processed/training_data.csv"
-
-    # Load interactions
-    interactions = pd.read_csv(INTERACTIONS_PATH)
-
-    # Split into train/test
-    train, test = time_based_split(interactions)
-
-    # Build training data
-    training_df = build_training_data(train)
-
-    # Save training data
-    save_training_data(training_df, TRAINING_OUTPUT_PATH)
+    
+    if pd.io.common.file_exists(INTERACTIONS_PATH):
+        interactions = pd.read_csv(INTERACTIONS_PATH)
+        train, test = time_based_split(interactions)
+        # Using 6 negatives (mix of hard/popular)
+        training_df = build_training_data(train, n_negatives=6)
+        save_training_data(training_df, TRAINING_OUTPUT_PATH)
+    else:
+        print("Interactions file not found.")
