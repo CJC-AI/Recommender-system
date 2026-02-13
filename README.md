@@ -1,20 +1,6 @@
-Below is an **updated, polished README.md** that incorporates **all recent changes** to your project:
-
-* Item–Item Collaborative Filtering
-* Co-occurrence matrix + cosine similarity
-* Cold-start logic
-* Updated evaluation results
-* Clear explanation of *why* results look the way they do
-* Keeps the professional, principled tone you’re already using
-
-You can **copy–paste this directly as your README.md**.
-
----
-
-```markdown
 # Recommender System
 
-An **end-to-end recommendation system** covering interaction modeling, candidate generation, offline evaluation, and clear modeling assumptions.
+A **two-layer hybrid recommendation pipeline** featuring regime-conditioned ranking under severe cold-start constraints.
 
 **Core question:**
 

@@ -27,7 +27,7 @@ def fast_compute_features(
     user_history_set: Set[int],
     user_last_ts: pd.Timestamp,
     similarity_matrix: Dict[int, Dict[int, float]],
-    item_popularity_dict: Dict[int, float],
+    item_stats_dict: Dict[int, dict], # Updated to accept dict of stats
     is_negative: bool = False
 ) -> dict:
     
@@ -36,7 +36,7 @@ def fast_compute_features(
     if user_history_set:
         neighbors = similarity_matrix.get(row_item_id, {})
         if neighbors:
-            # Fast set intersection to find overlap between history and item's neighbors
+            # Fast set intersection
             common_items = user_history_set.intersection(neighbors.keys())
             if common_items:
                 max_sim = max(neighbors[i] for i in common_items)
@@ -45,14 +45,19 @@ def fast_compute_features(
     time_diff = 0.0
     if not pd.isnull(user_last_ts):
         time_diff = (row_ts - user_last_ts).total_seconds() / 3600.0
-        
+    
+    # 3. Retrieve Item Stats (Pop + Count)
+    # item_stats_dict is now {item_id: {'score': 0.5, 'count': 120}}
+    stats = item_stats_dict.get(row_item_id, {'score': 0.0, 'count': 0.0})
+
     return {
         "user_id": row_user_id,
         "item_id": row_item_id,
         "item_similarity_score": max_sim,
-        "item_popularity": item_popularity_dict.get(row_item_id, 0.0),
+        "item_popularity": stats['score'],       # Normalized Score
+        "item_interaction_count": stats['count'], # NEW: Raw Volume
+        "user_history_count": len(user_history_set), # NEW: Warm vs Cold signal
         "time_since_last_interaction": max(0.0, time_diff),
-        # Negatives get 0.0 weight to distinguish them from real interactions
         "interaction_type_weight": 0.0 if is_negative else get_interaction_type_weight(row_weight),
         "label": 0 if is_negative else 1
     }
@@ -62,9 +67,9 @@ def fast_compute_features(
 # -------------------------------------------------------
 def build_training_data(
     train_df: pd.DataFrame,
-    sample_users_frac: float = 1.0,  # Use all users by default
+    sample_users_frac: float = 0.2, 
     sample_items_top_n: int = 5000,    
-    n_negatives: int = 6,              # Increased to 6 (range 5-10)
+    n_negatives: int = 6,              
     min_cooccurrence: int = 2,
     seed: int = 42,
 ) -> pd.DataFrame:
@@ -77,7 +82,7 @@ def build_training_data(
     3. Exclusions: Items user interacted with in Past OR Future.
     """
     
-    print(f"Building TRAINING data with HARD & POPULAR negatives...")
+    print(f"Building TRAINING data with Enhanced Features...")
     rng = np.random.RandomState(seed)
     
     # --- 1. Pre-processing ---
@@ -107,15 +112,23 @@ def build_training_data(
     
     # Popularity (for Popular Negatives - Proxy for 'up to time t')
     pop_df = compute_item_popularity(train_df)
-    item_popularity_dict = pop_df.set_index("item_id")["interaction_score"].to_dict()
     
-    # Normalize Popularity
-    max_pop = max(item_popularity_dict.values()) if item_popularity_dict else 1.0
-    item_popularity_dict = {k: v / max_pop for k, v in item_popularity_dict.items()}
+    # Normalization (Max-Scale)
+    max_score = pop_df["interaction_score"].max()
+    max_count = pop_df["interaction_count"].max()
     
-    # Top N universe for popular sampling
-    popular_items_universe = pop_df.head(sample_items_top_n)["item_id"].values
+    # Create a fast lookup dict: {item_id: {'score': norm_score, 'count': norm_count}}
+    item_stats_dict = {}
+    for row in pop_df.itertuples():
+        item_stats_dict[row.item_id] = {
+            'score': row.interaction_score / max_score if max_score > 0 else 0,
+            'count': row.interaction_count / max_count if max_count > 0 else 0
+        }
     
+    # Sample from the FULL item list to avoid penalizing popular items exclusively.
+    # This ensures the model sees popular items as both Positives (labels=1) and Negatives (labels=0).
+    all_items_universe = pop_df["item_id"].values 
+
     # GLOBAL History (Past + Future) for strict exclusions
     # We must not sample an item as negative if the user will interact with it later
     user_global_history = train_df.groupby("user_id")["item_id"].apply(set).to_dict()
@@ -144,7 +157,7 @@ def build_training_data(
         pos_row = fast_compute_features(
             u_id, i_id, ts, score, 
             current_history, last_ts, 
-            similarity_matrix, item_popularity_dict, 
+            similarity_matrix, item_stats_dict, 
             is_negative=False
         )
         training_data.append(pos_row)
@@ -174,30 +187,29 @@ def build_training_data(
         rng.shuffle(hard_candidates_list)
         
         for cand in hard_candidates_list:
-            if len(selected_negatives) >= hard_quota:
-                break
+            if len(selected_negatives) >= hard_quota: break
             # Strict Exclusion: Not in Past, Current, or Future
             if cand not in full_history_exclusion and cand != i_id:
                 selected_negatives.append(cand)
                 
-        # Source 2: Popular Negatives (Backfill the rest)
+        # Source 2: General/Popular Negatives (Backfill the rest)
         # We sample more than needed to account for collisions
         needed = n_negatives - len(selected_negatives)
         if needed > 0:
-            pop_candidates = rng.choice(popular_items_universe, size=needed * 3)
+            # --- Use the full universe ---
+            pop_candidates = rng.choice(all_items_universe, size=needed * 3)
             for cand in pop_candidates:
-                if len(selected_negatives) >= n_negatives:
-                    break
+                if len(selected_negatives) >= n_negatives: break
                 # Deduplicate and Exclude
                 if cand not in full_history_exclusion and cand != i_id and cand not in selected_negatives:
                     selected_negatives.append(cand)
         
-        # --- C. Compute Negative Features ---
+        # --- C. Negative Features ---
         for neg_id in selected_negatives:
             neg_row = fast_compute_features(
                 u_id, neg_id, ts, 0.0, 
                 current_history, last_ts, 
-                similarity_matrix, item_popularity_dict, 
+                similarity_matrix, item_stats_dict, 
                 is_negative=True
             )
             training_data.append(neg_row)
@@ -210,8 +222,6 @@ def build_training_data(
 
     df_final = pd.DataFrame(training_data)
     print(f"  Final Dataset: {len(df_final)} rows.")
-    print(f"  Positives: {sum(df_final['label']==1)}")
-    print(f"  Negatives: {sum(df_final['label']==0)}")
     return df_final
 
 
@@ -220,14 +230,12 @@ def save_training_data(training_df: pd.DataFrame, output_path: str):
     print(f"Saved to {output_path}")
 
 if __name__ == "__main__":
-    # Example usage flow
     INTERACTIONS_PATH = "data/processed/interactions.csv"
     TRAINING_OUTPUT_PATH = "data/processed/training_data.csv"
     
     if pd.io.common.file_exists(INTERACTIONS_PATH):
         interactions = pd.read_csv(INTERACTIONS_PATH)
         train, test = time_based_split(interactions)
-        # Using 6 negatives (mix of hard/popular)
         training_df = build_training_data(train, n_negatives=6)
         save_training_data(training_df, TRAINING_OUTPUT_PATH)
     else:

@@ -1,9 +1,7 @@
 import pandas as pd
 import numpy as np
 from collections import defaultdict
-from itertools import combinations
-from typing import Dict, Set, Tuple
-
+from typing import Dict, Set
 
 # -------------------------------------------------------
 # Popularity (fallback)
@@ -22,8 +20,11 @@ def compute_item_popularity(train_df: pd.DataFrame) -> pd.DataFrame:
     """
     item_popularity = (
         train_df
-        .groupby("item_id")["interaction_score"]
-        .sum()
+        .groupby("item_id")
+        .agg(
+            interaction_score=("interaction_score", "sum"),
+            interaction_count=("interaction_score", "count")
+        )
         .reset_index()
         .sort_values("interaction_score", ascending=False)
     )
@@ -87,15 +88,14 @@ def build_cooccurrence_matrix(
     
     for item_a, cooccurrences in cooccurrence_counts.items():
         similarity_matrix[item_a] = {}
-        
+
         for item_b, count in cooccurrences.items():
             # Filter out low co-occurrence pairs (noise reduction)
             if count < min_cooccurrence:
                 continue
-            
+
             # Cosine similarity: count / sqrt(count_a * count_b)
             denominator = np.sqrt(item_counts[item_a] * item_counts[item_b])
-            
             if denominator > 0:
                 similarity_matrix[item_a][item_b] = count / denominator
     
@@ -123,17 +123,16 @@ def get_similar_items(
     """
     # Get similar items for this item
     similar_items_dict = similarity_matrix.get(item_id, {})
-    
+
     # Sort by similarity score (descending) and take top K
     sorted_similar = sorted(
         similar_items_dict.items(),
         key=lambda x: x[1],
         reverse=True
     )
-    
+
     # Extract just the item IDs
     similar_items = [item for item, score in sorted_similar[:top_k]]
-    
     return similar_items
 
 
@@ -173,11 +172,7 @@ def recommend_item_based(
     # --- COLD-START 1: User has no history ---
     if not user_history:
         # Fallback to popularity-based recommendations
-        return recommend_top_k_popular(
-            user_history=set(),
-            top_popular_items=top_popular_items,
-            k=k
-        )
+        return recommend_top_k_popular(set(), top_popular_items, k)
     
     # Aggregate candidate items and their scores
     candidate_scores = {}
@@ -186,7 +181,7 @@ def recommend_item_based(
     for item_id in user_history:
         # Get similar items from the matrix
         similar_items_dict = similarity_matrix.get(item_id, {})
-        
+
         if similar_items_dict:
             items_with_neighbors += 1
             
@@ -208,13 +203,9 @@ def recommend_item_based(
     if items_with_neighbors == 0 or not candidate_scores:
         # None of the user's items had similar items in the matrix
         # Fallback to popularity
-        return recommend_top_k_popular(
-            user_history=user_history,
-            top_popular_items=top_popular_items,
-            k=k
-        )
+        return recommend_top_k_popular(user_history, top_popular_items, k)
     
-    # Sort candidates by aggregated score
+    # Sort candidates
     sorted_candidates = sorted(
         candidate_scores.items(),
         key=lambda x: x[1],
@@ -261,14 +252,9 @@ def recommend_top_k_popular(
         List of recommended item IDs
     """
     recommendations = []
-    
     for item in top_popular_items:
-        # If user hasn't seen it, add it
         if item not in user_history:
             recommendations.append(item)
-        
-        # Stop once we have enough recommendations
         if len(recommendations) >= k:
             break
-    
     return recommendations

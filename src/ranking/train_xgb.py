@@ -1,210 +1,148 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-import math
-
+import joblib
+import os
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (roc_auc_score, log_loss, 
+                             recall_score, precision_score, 
+                             classification_report)
 
 # -------------------------------------------------------
 # Configuration
 # -------------------------------------------------------
-TRAINING_DATA_PATH  = "data/processed/training_data.csv"
-MODEL_OUTPUT_PATH   = "artifacts/models/xgb_ranker.json"
+TRAINING_DATA_PATH = "data/processed/training_data.csv"
+MODEL_OUTPUT_PATH  = "artifacts/models/xgb_ranker.json"
 
+
+# NO LEAKAGE: interaction_type_weight is excluded from features
 FEATURE_COLUMNS = [
     "item_similarity_score",
     "item_popularity",
+    "item_interaction_count",
+    "user_history_count",
     "time_since_last_interaction",
-    "interaction_type_weight",
+    
 ]
 
-VAL_FRACTION = 0.1
-
+# XGBoost Hyperparameters (tuned for Ranking/Imbalance)
 XGB_PARAMS = {
-    "objective":        "binary:logistic",
-    "eval_metric":      "logloss",
-    "max_depth":        6,
-    "learning_rate":    0.1,
-    "subsample":        0.8,
+    "n_estimators": 300,
+    "learning_rate": 0.05,
+    "max_depth": 6,              # Deep enough to capture non-linear interaction
+    "subsample": 0.8,            # Prevent overfitting
     "colsample_bytree": 0.8,
-    "seed":             42,
-    "verbosity":        0,
+    "objective": "binary:logistic",
+    "eval_metric": "auc",
+    "random_state": 42,
+    "n_jobs": -1                 # Use all CPU cores
 }
-
-NUM_BOOST_ROUNDS = 200
-EARLY_STOP_ROUNDS = 20
-
 
 # -------------------------------------------------------
 # Load & Split
 # -------------------------------------------------------
-def load_and_split(
-    path: str = TRAINING_DATA_PATH,
-    val_fraction: float = VAL_FRACTION,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_and_prep(path: str = TRAINING_DATA_PATH):
     """
-    Load training data and split into train / val.
-
-    Positional split preserves temporal ordering from dataset.py.
-
-    Args:
-        path: Path to training_data.csv
-        val_fraction: Fraction held out for validation
-
-    Returns:
-        (train_df, val_df)
+    Load data and prepare features, targets, and weights.
     """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Training data not found at {path}")
+        
     df = pd.read_csv(path)
-    print(f"Loaded {len(df):,} rows from {path}")
+    print(f"Loaded {len(df):,} rows.")
     print(f"  Positive ratio: {df['label'].mean():.3f}")
 
-    split_idx = int(len(df) * (1 - val_fraction))
-    train_df  = df.iloc[:split_idx].copy()
-    val_df    = df.iloc[split_idx:].copy()
+    # 1. Features & Target
+    X = df[FEATURE_COLUMNS]
+    y = df["label"]
 
-    print(f"  Train: {len(train_df):,}  |  Val: {len(val_df):,}")
-    return train_df, val_df
+    # 2. Sample Weights (Crucial Step)
+    # Map negatives (weight=0.0) to 1.0 so the model learns from them.
+    # Keep positives at their original weight (View=1, Purchase=5)
+    weights = df["interaction_type_weight"].values.copy()
+    weights[weights == 0] = 1.0
 
+    # 3. Stratified Split
+    # We use stratified split here to ensure Validation has same Pos/Neg ratio
+    X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
+        X, y, weights, test_size=0.1, stratify=y, random_state=42
+    )
+
+    print(f"  Train: {len(X_train):,} | Val: {len(X_val):,}")
+    
+    return X_train, X_val, y_train, y_val, w_train, w_val
 
 # -------------------------------------------------------
 # Train
 # -------------------------------------------------------
-def train_xgb(
-    train_df: pd.DataFrame,
-    val_df:   pd.DataFrame,
-) -> xgb.Booster:
+def train_xgboost(X_train, y_train, w_train, X_val, y_val):
     """
-    Train an XGBoost binary:logistic ranker with early stopping on val.
-
-    Args:
-        train_df: Training split
-        val_df:   Validation split (used for early stopping only)
-
-    Returns:
-        Trained xgb.Booster
+    Train XGBoost with Early Stopping and Sample Weights.
     """
-    dtrain = xgb.DMatrix(
-        train_df[FEATURE_COLUMNS].values,
-        label=train_df["label"].values,
+    print("\nTraining XGBoost Ranker...")
+    
+    model = xgb.XGBClassifier(
+        **XGB_PARAMS,
+        early_stopping_rounds=50,
+        )
+    
+    model.fit(
+        X_train, y_train,
+        sample_weight=w_train,
+        eval_set=[(X_val, y_val)],
+        verbose=50
     )
-    dval = xgb.DMatrix(
-        val_df[FEATURE_COLUMNS].values,
-        label=val_df["label"].values,
-    )
-
-    evals_log: list = []
-
-    model = xgb.train(
-        params=XGB_PARAMS,
-        dtrain=dtrain,
-        num_boost_round=NUM_BOOST_ROUNDS,
-        evals=[(dtrain, "train"), (dval, "val")],
-        early_stopping_rounds=EARLY_STOP_ROUNDS,
-        evals_log=evals_log,
-        verbose_eval=50,
-    )
-
-    print(f"\nXGBoost trained.  Best iteration: {model.best_iteration}")
-    print(f"  Train log-loss: {evals_log['train']['logloss'][model.best_iteration]:.4f}")
-    print(f"  Val   log-loss: {evals_log['val']['logloss'][model.best_iteration]:.4f}")
+    
+    print("Training Complete.")
     return model
 
-
 # -------------------------------------------------------
-# NDCG@K helper
+# Evaluate
 # -------------------------------------------------------
-def _dcg(relevances: list) -> float:
-    """Compute DCG for a ranked list of binary relevances."""
-    return sum(
-        rel / math.log2(i + 2)          # i is 0-indexed → denominator = log2(rank+1)
-        for i, rel in enumerate(relevances)
-    )
-
-
-def ndcg_at_k(y_true: np.ndarray, y_score: np.ndarray, k: int = 10) -> float:
+def evaluate_model(model, X_val, y_val):
     """
-    Compute NDCG@K for a single user's candidate list.
-
-    Args:
-        y_true:  Binary ground-truth labels (1 = relevant)
-        y_score: Predicted scores (higher = more relevant)
-        k:       Cut-off rank
-
-    Returns:
-        NDCG@K score (0.0–1.0)
+    Detailed evaluation including Feature Importance.
     """
-    # Sort by predicted score descending, take top-k
-    order   = np.argsort(-y_score)[:k]
-    ranked  = y_true[order].tolist()
+    # Predict Probabilities (for Ranking/AUC)
+    y_prob = model.predict_proba(X_val)[:, 1]
+    
+    # Predict Classes (Threshold 0.5 for precision/recall metrics)
+    y_pred = (y_prob >= 0.5).astype(int)
 
-    dcg  = _dcg(ranked)
+    auc = roc_auc_score(y_val, y_prob)
+    logloss = log_loss(y_val, y_prob)
+    
+    print("\n" + "="*40)
+    print("FINAL VALIDATION METRICS")
+    print("="*40)
+    print(f"  AUC:       {auc:.4f}")
+    print(f"  Log Loss:  {logloss:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(y_val, y_pred))
 
-    # Ideal: all 1 s first
-    ideal = sorted(y_true.tolist(), reverse=True)[:k]
-    idcg  = _dcg(ideal)
-
-    return dcg / idcg if idcg > 0 else 0.0
-
+    # Plot Feature Importance
+    print("\nGenerating Feature Importance Plot...")
+    
+    xgb.plot_importance(model, importance_type='gain', max_num_features=10, title='Feature Importance (Gain)')
+    plt.tight_layout()
+    
+    return auc
 
 # -------------------------------------------------------
-# Evaluate NDCG@10
-# -------------------------------------------------------
-def evaluate_xgb(model: xgb.Booster, val_df: pd.DataFrame, k: int = 10) -> dict:
-    """
-    Score every user in val, group by user_id, compute per-user NDCG@K,
-    then return the macro-average.
-
-    Args:
-        model: Trained Booster
-        val_df: Validation DataFrame (must contain user_id, label, FEATURE_COLUMNS)
-        k:      Rank cut-off
-
-    Returns:
-        Dict with 'ndcg_at_10' (macro-averaged over users)
-    """
-    dval = xgb.DMatrix(val_df[FEATURE_COLUMNS].values)
-    val_df = val_df.copy()
-    val_df["score"] = model.predict(dval)
-
-    ndcgs = []
-    for user_id, group in val_df.groupby("user_id"):
-        if group["label"].sum() == 0:
-            # No positive example for this user in val → skip
-            continue
-        ndcgs.append(
-            ndcg_at_k(
-                y_true  = group["label"].values,
-                y_score = group["score"].values,
-                k=k,
-            )
-        )
-
-    mean_ndcg = np.mean(ndcgs) if ndcgs else 0.0
-    print(f"Validation NDCG@{k}: {mean_ndcg:.4f}  (over {len(ndcgs)} users)")
-    return {"ndcg_at_10": mean_ndcg}
-
-
-# -------------------------------------------------------
-# Save
-# -------------------------------------------------------
-def save_model(model: xgb.Booster, path: str = MODEL_OUTPUT_PATH):
-    """
-    Persist XGBoost model as JSON.
-
-    Args:
-        model: Trained Booster
-        path:  Output path
-    """
-    import os
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    model.save_model(path)
-    print(f"Model saved → {path}")
-
-
-# -------------------------------------------------------
-# CLI Entry Point
+# Main Execution
 # -------------------------------------------------------
 if __name__ == "__main__":
-    train_df, val_df = load_and_split()
-    model            = train_xgb(train_df, val_df)
-    evaluate_xgb(model, val_df)
-    save_model(model)
+    # 1. Load Data
+    X_train, X_val, y_train, y_val, w_train, w_val = load_and_prep()
+    
+    # 2. Train
+    model = train_xgboost(X_train, y_train, w_train, X_val, y_val)
+    
+    # 3. Evaluate
+    evaluate_model(model, X_val, y_val)
+    
+    # 4. Save
+    os.makedirs(os.path.dirname(MODEL_OUTPUT_PATH), exist_ok=True)
+    model.save_model(MODEL_OUTPUT_PATH)
+    print(f"\nModel saved to {MODEL_OUTPUT_PATH}")

@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import joblib
 import xgboost as xgb
+import os
 from typing import Dict, Set
 
 from src.candidate_generation import (
@@ -9,21 +10,24 @@ from src.candidate_generation import (
     compute_item_popularity,
     recommend_item_based,
 )
-from src.dataset import fast_compute_features
+from src.ranking.dataset import fast_compute_features
 
 
 # -------------------------------------------------------
 # Configuration
 # -------------------------------------------------------
-INTERACTIONS_PATH   = "data/processed/interactions.csv"
-LR_MODEL_PATH       = "models/lr_ranker.joblib"
-XGB_MODEL_PATH      = "models/xgb_ranker.json"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+INTERACTIONS_PATH   = os.path.join(BASE_DIR, "data", "processed", "interactions.csv")
+LR_MODEL_PATH       = os.path.join(BASE_DIR, "artifacts", "models", "lr_ranker.joblib")
+XGB_MODEL_PATH      = os.path.join(BASE_DIR, "artifacts", "models", "xgb_ranker.json")
 
+# Matches the 5-feature schema of your trained model
 FEATURE_COLUMNS = [
     "item_similarity_score",
     "item_popularity",
-    "time_since_last_interaction",
-    "interaction_type_weight",
+    "item_interaction_count",       
+    "user_history_count",           
+    "time_since_last_interaction",  
 ]
 
 N_CANDIDATES = 50      # candidates pulled from item-item CF
@@ -31,20 +35,10 @@ K_FINAL      = 10      # final recommendations returned
 
 
 # -------------------------------------------------------
-# Shared State (built once, reused across calls)
+# Shared State 
 # -------------------------------------------------------
 class RankingContext:
-    """
-    Holds every pre-computed artifact needed to score candidates.
-    Build once at startup; pass into infer().
-
-    Attributes:
-        similarity_matrix:    {item_id: {neighbor_id: score}}
-        item_popularity_dict: {item_id: normalised popularity}
-        top_popular_items:    list sorted descending by popularity
-        user_histories:       {user_id: set of item_ids} from TRAIN only
-        user_last_ts:         {user_id: last interaction timestamp}  from TRAIN only
-    """
+    """Holds pre-computed artifacts for scoring."""
 
     def __init__(self, train_df: pd.DataFrame, min_cooccurrence: int = 2):
         print("Building RankingContext …")
@@ -54,99 +48,83 @@ class RankingContext:
             train_df = train_df.copy()
             train_df["last_interaction_ts"] = pd.to_datetime(train_df["last_interaction_ts"])
 
-        # Similarity
-        self.similarity_matrix: Dict[int, Dict[int, float]] = build_cooccurrence_matrix(
-            interactions=train_df,
-            min_cooccurrence=min_cooccurrence,
+        # --- Synchronize Time ---
+        # Capture the max training timestamp. We use this as "Now" during inference
+        # to ensure feature distributions match the training data. 
+        self.max_train_ts = train_df["last_interaction_ts"].max()
+
+        # --- Pass min_cooccurrence as kwarg to avoid positional mismatch ---
+        self.similarity_matrix = build_cooccurrence_matrix(
+            interactions=train_df, 
+            min_cooccurrence=min_cooccurrence
         )
         print(f"  similarity_matrix: {len(self.similarity_matrix):,} items")
 
-        # Popularity (normalised)
+        # Popularity & Stats
         pop_df = compute_item_popularity(train_df)
-        raw    = pop_df.set_index("item_id")["interaction_score"].to_dict()
-        max_pop = max(raw.values()) if raw else 1.0
-        self.item_popularity_dict: Dict[int, float] = {k: v / max_pop for k, v in raw.items()}
-        self.top_popular_items: list = pop_df["item_id"].tolist()   # already sorted desc
+        
+        max_score = pop_df["interaction_score"].max()
+        max_count = pop_df["interaction_count"].max()
+        self.item_stats_dict = {}
+        for row in pop_df.itertuples():
+            self.item_stats_dict[row.item_id] = {
+                'score': row.interaction_score / max_score if max_score > 0 else 0,
+                'count': row.interaction_count / max_count if max_count > 0 else 0
+            }
+            
+        self.top_popular_items = pop_df["item_id"].tolist()
 
-        # Per-user history & last timestamp (train only)
-        self.user_histories: Dict[int, Set[int]] = (
-            train_df.groupby("user_id")["item_id"].apply(set).to_dict()
-        )
-        self.user_last_ts: Dict[int, pd.Timestamp] = (
-            train_df.groupby("user_id")["last_interaction_ts"].max().to_dict()
-        )
+        # User History
+        self.user_histories = train_df.groupby("user_id")["item_id"].apply(set).to_dict()
+        self.user_last_ts = train_df.groupby("user_id")["last_interaction_ts"].max().to_dict()
         print("  RankingContext ready.")
 
 
 # -------------------------------------------------------
-# Load a trained model (LR or XGB)
+# Load Model
 # -------------------------------------------------------
 def load_model(model_path: str):
     """
-    Load whichever model lives at *model_path*.
-
-    Returns a thin wrapper that exposes a uniform .score(X) → np.ndarray
-    interface so the rest of infer.py doesn't care about model type.
-
-    Args:
-        model_path: path to .joblib (LR) or .json (XGB)
-
-    Returns:
-        _ModelWrapper
+    Unified loader that patches scikit-learn 1.5+ attribute errors on the fly.
     """
-
     class _ModelWrapper:
-        """Duck-type wrapper: always exposes score(X) → 1-D array of P(positive)."""
-
         def __init__(self, path: str):
             if path.endswith(".joblib"):
+                # 1. Load the pipeline
                 self._model = joblib.load(path)
-                self._kind  = "lr"
-            elif path.endswith(".json"):
+
+                # 2. Extract the actual LogisticRegression object
+                # If it's a Pipeline, it's in named_steps['model']
+                if hasattr(self._model, 'named_steps'):
+                    lr_obj = self._model.named_steps['model']
+                else:
+                    lr_obj = self._model
+
+                # MONKEY PATCH: If 'multi_class' is missing, add it.
+                # Newer scikit-learn versions removed this, but internal 
+                # functions sometimes still look for it in serialized objects. 
+                if not hasattr(lr_obj, 'multi_class'):
+                    lr_obj.multi_class = 'auto' 
+                self._kind = "lr"
+            else:
                 self._model = xgb.Booster()
                 self._model.load_model(path)
-                self._kind  = "xgb"
-            else:
-                raise ValueError(f"Unsupported model format: {path}")
-            print(f"Loaded {self._kind} model from {path}")
+                self._kind = "xgb"
 
         def score(self, X: np.ndarray) -> np.ndarray:
             if self._kind == "lr":
                 return self._model.predict_proba(X)[:, 1]
-            else:
-                return self._model.predict(xgb.DMatrix(X))
+            return self._model.predict(xgb.DMatrix(X, feature_names=FEATURE_COLUMNS))
 
     return _ModelWrapper(model_path)
 
 
 # -------------------------------------------------------
-# Core inference
+# Core Inference
 # -------------------------------------------------------
-def infer(
-    user_id: int,
-    ctx: RankingContext,
-    model,                        # _ModelWrapper from load_model()
-    n_candidates: int = N_CANDIDATES,
-    k: int = K_FINAL,
-) -> list[int]:
+def infer(user_id: int, ctx: RankingContext, model, n_candidates: int = N_CANDIDATES, k: int = K_FINAL) -> list[int]:
     """
     Full inference pipeline for a single user.
-
-    1. Pull top-N candidates via item-item CF (popularity fallback built in).
-    2. Compute the 4 ranking features for every candidate using
-       fast_compute_features() from dataset.py — keeps feature logic in one place.
-    3. Score with the trained model.
-    4. Sort descending, return top-K item_ids.
-
-    Args:
-        user_id:      Target user
-        ctx:          Pre-computed RankingContext
-        model:        Loaded model wrapper
-        n_candidates: How many candidates to retrieve (step 1)
-        k:            How many final recommendations to return
-
-    Returns:
-        List of item_ids, length ≤ k
     """
     user_history = ctx.user_histories.get(user_id, set())
     user_last    = ctx.user_last_ts.get(user_id, pd.NaT)
@@ -162,92 +140,62 @@ def infer(
     if not candidates:
         return []
 
-    # --- 2. Feature computation ---
-    # Use a synthetic "now" timestamp for time_since_last so the feature is
-    # computed consistently with training.  If the user has no last_ts we
-    # fall back to the same row timestamp (fast_compute_features handles NaT).
-    now = pd.Timestamp.now()
+     # --- 2. Feature computation ---
+    # --- Use Frozen Time ---
+    # Use the max timestamp from training, NOT the current wall-clock time.
+    # This prevents 'time_since_last_interaction' from becoming massive (out of distribution).
+    now = ctx.max_train_ts
 
     feature_rows = [
         fast_compute_features(
             row_user_id          = user_id,
             row_item_id          = item_id,
             row_ts               = now,
-            row_weight           = 0.0,          # unknown at inference time → 0
+            row_weight           = 0.0,
             user_history_set     = user_history,
             user_last_ts         = user_last,
             similarity_matrix    = ctx.similarity_matrix,
-            item_popularity_dict = ctx.item_popularity_dict,
-            is_negative          = True,          # weight set to 0 via is_negative
+            item_stats_dict      = ctx.item_stats_dict, 
+            is_negative          = True, 
         )
         for item_id in candidates
     ]
 
     feature_df = pd.DataFrame(feature_rows)
-    X          = feature_df[FEATURE_COLUMNS].values
+    X = feature_df[FEATURE_COLUMNS].values
 
-    # --- 3. Score ---
-    scores = model.score(X)
+    ## --- 3. Score ---
+    try:
+        scores = model.score(X)
+    except Exception as e:
+        print(f"Error during scoring for user {user_id}: {e}")
+        return candidates[:k] # Fallback to item-based order
 
     # --- 4. Sort & return top-K ---
     feature_df["_score"] = scores
-    top_k = (
-        feature_df
-        .nlargest(k, "_score")["item_id"]
-        .tolist()
-    )
+    top_k = feature_df.nlargest(k, "_score")["item_id"].tolist()
     return top_k
 
 
 # -------------------------------------------------------
-# Batch helper  (score every user in a DataFrame)
+# Batch Helper
 # -------------------------------------------------------
-def infer_batch(
-    user_ids: list[int],
-    ctx: RankingContext,
-    model,
-    n_candidates: int = N_CANDIDATES,
-    k: int = K_FINAL,
-) -> Dict[int, list[int]]:
-    """
-    Run infer() for every user in the list.
-
-    Args:
-        user_ids:     List of user IDs to score
-        ctx:          RankingContext
-        model:        Loaded model wrapper
-        n_candidates: Candidates per user
-        k:            Final recs per user
-
-    Returns:
-        {user_id: [item_id, …]}  (length ≤ k per user)
-    """
-    results: Dict[int, list[int]] = {}
+def infer_batch(user_ids: list[int], ctx: RankingContext, model, n_candidates: int = N_CANDIDATES, k: int = K_FINAL) -> Dict[int, list[int]]:
+    results = {}
     for i, uid in enumerate(user_ids):
         results[uid] = infer(uid, ctx, model, n_candidates, k)
         if (i + 1) % 1000 == 0:
             print(f"  Scored {i + 1:,}/{len(user_ids):,} users")
     return results
 
-
-# -------------------------------------------------------
-# CLI Entry Point  (smoke-test with 5 users)
-# -------------------------------------------------------
 if __name__ == "__main__":
-    from src.evaluation import time_based_split
-
-    # 1. Load interactions → train split only
-    interactions = pd.read_csv(INTERACTIONS_PATH)
-    train, _test = time_based_split(interactions)
-
-    # 2. Build shared context
-    ctx = RankingContext(train)
-
-    # 3. Load model  (swap path to LR_MODEL_PATH if preferred)
-    model = load_model(XGB_MODEL_PATH)
-
-    # 4. Run for 5 sample users
-    sample_users = train["user_id"].unique()[:5].tolist()
-    for uid in sample_users:
-        recs = infer(uid, ctx, model)
-        print(f"  user {uid} → {recs}")
+    from src.ranking.evaluation import time_based_split
+    if os.path.exists(INTERACTIONS_PATH) and os.path.exists(XGB_MODEL_PATH):
+        interactions = pd.read_csv(INTERACTIONS_PATH)
+        train, _test = time_based_split(interactions)
+        ctx = RankingContext(train)
+        model = load_model(XGB_MODEL_PATH)
+        sample_users = train["user_id"].unique()[:5].tolist()
+        for uid in sample_users:
+            recs = infer(uid, ctx, model)
+            print(f"  user {uid} → {recs}")
