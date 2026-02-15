@@ -197,3 +197,38 @@ def compare_models(
         "item_based": cf_metrics,
         "ranked":     ranked_metrics,
     }
+
+
+# -------------------------------------------------------
+# Candidate Coverage
+# -------------------------------------------------------
+
+def compute_candidate_coverage(interactions: pd.DataFrame):
+    
+    print("Loading interactions...")
+    
+    # 1. Split Data (Same split as training)
+    train, test = time_based_split(interactions)
+    
+    # 2. Evaluate Candidate Generator @ 50
+    # We use the existing evaluation function but set k=50.
+    # Note: The function returns keys like 'Recall@10' hardcoded, 
+    # but since we passed k=50, the value is actually Recall@50.
+    print("\nComputing Candidate Recall@50...")
+    metrics = evaluate_item_based_model(
+        train, 
+        test, 
+        k=50,  # <--- The key parameter
+        candidates_per_item=50
+    )
+    
+    coverage = metrics['Recall@10'] # This is actually Recall@50 due to k=50
+    
+    print("\n" + "="*40)
+    print("CANDIDATE GENERATION PERFORMANCE")
+    print("="*40)
+    print(f"Candidate Recall@50:  {coverage:.4f}")
+    print(f"Maximum Possible Recall: {coverage:.4f}")
+    print("="*40)
+    print(f"Interpretation: The Ranker can theoretically achieve at most {coverage:.1%} recall.")
+    print("If this number is low, improve the Candidate Generator (Item-Item CF) first.")
