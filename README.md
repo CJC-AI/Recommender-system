@@ -72,7 +72,7 @@ Each event includes:
 
 ---
 
-## Interaction Definition
+## Stage1 - Interaction Definition
 
 User behavior is converted into **implicit feedback** using weighted event signals:
 
@@ -280,11 +280,11 @@ As a result:
 * Long-tail discovery is difficult
 * Gains require stronger signals or context
 
-These limitations are **intentional and instructional** at this stage.
+These limitations are **intentional and instructional** at this stage 1.
 
 ---
 
-# Logistic Regression Training Summary
+# Stage 2 - Logistic Regression Training Summary
 
 - Training rows: **12,013,001**
 - Validation AUC: **0.7803**
