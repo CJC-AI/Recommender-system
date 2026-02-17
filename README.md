@@ -1,91 +1,122 @@
-# Recommender System
+# Recommender System — RetailRocket Dataset
 
-A **two-layer hybrid recommendation pipeline** featuring regime-conditioned ranking under severe cold-start constraints.
+A **two-stage hybrid recommendation system** built under extreme sparsity and cold-start constraints.
 
 **Core question:**
 
-> *Given user behavior, what should we show next — and why?*
+> Given past user behavior, what should we show next — and why?
 
-This project emphasizes **correct data handling, defensible baselines, and evaluation discipline**, not just model complexity.
+This project focuses on system design, correct evaluation, and bottleneck diagnosis — not just model complexity.
 
 ---
 
-## Project Structure
+# 1. Problem Context
+
+The dataset presents a difficult real-world scenario:
+
+* **302,356 test users**
+* **~92% are cold-start users** (only one interaction)
+* **89% of items are never purchased**
+* Extremely sparse user–item matrix
+
+This means:
+
+* Personalization is heavily constrained
+* Candidate generation becomes the primary bottleneck
+* Ranking alone cannot solve the problem
+
+This project is designed to measure and diagnose those limits clearly.
+
+---
+
+# 2. Project Structure
 
 ```
-
 Recommender-system/
 │
 ├── data/
-│   ├── raw/                            # Original events data
-|   |   ├── category_tree.csv
-|   |   ├── events.csv
-|   |   ├── item_properties_part1.csv
-|   |   └── item_properties_part2.csv     
-│   └── processed/                      # Aggregated interactions
+│   ├── raw/
+│   │   ├── events.csv
+│   │   ├── category_tree.csv
+│   │   ├── item_properties_part1.csv
+│   │   └── item_properties_part2.csv
+│   │
+│   └── processed/
 │       ├── interactions.csv
-|       └── training_data.csv
-|
+│       └── training_data.csv
+│
 ├── src/
-│   ├── ranking/
-|   |   ├── dataset.py
-|   |   ├── train_lr.py
-|   |   ├── train_xgb.py
-|   |   ├── infer.py
-|   |   └── evaluation.py      # Train/test split + metrics
+│   ├── interactions.py
 │   ├── candidate_generation.py
-│   └── interactions.py        # Interaction construction
+│   ├── ranking/
+│   │   ├── dataset.py
+│   │   ├── train_lr.py
+│   │   ├── train_xgb.py
+│   │   ├── infer.py
+│   │   └── evaluation.py
 │
 ├── notebooks/
-│   └── eda.ipynb            # Exploratory analysis
+│   └── eda.ipynb
 │
 └── README.md
-
 ```
-## System Overview
-
-### Stage 1 — Candidate Generation
-- Item-Item co-occurrence similarity
-- Popularity fallback
-- Top-N candidates per user
-
-### Stage 2 — Logistic Regression Ranker
-The ranker re-scores candidates using the following features:
-
-- `item_similarity_score`
-- `item_popularity`
-- `time_since_last_interaction`
-- `user_history_count` ✅ (added)
-- `item_interaction_count` ✅ (added)
-
-The last two features were introduced to improve behavior modeling under extreme sparsity.
 
 ---
 
-## Dataset & Interaction Modeling
+# 3. System Architecture
 
-### Dataset Source
-
-The dataset used in this project is the **RetailRocket Recommender System Dataset**, obtained from **Kaggle**.
-
-It contains anonymized user interaction logs from an e-commerce platform, including:
-
-- Page views
-- Add-to-cart events
-- Purchase (transaction) events
-
-Each event includes:
-
-- Timestamp
-- User identifier
-- Item identifier
-- Event type
+The system follows a **retrieval → ranking pipeline**, similar to production recommender systems.
 
 ---
 
-## Stage1 - Interaction Definition
+## Stage 1 — Candidate Generation (Retrieval Layer)
 
-User behavior is converted into **implicit feedback** using weighted event signals:
+Candidates are generated using:
+
+1. **Item–Item Collaborative Filtering**
+
+   * Cosine similarity over co-occurrence counts
+   * Normalized to reduce popularity bias
+
+2. **Popularity Fallback**
+
+   * Used for cold-start users or isolated items
+
+3. **Taxonomy Augmentation**
+
+   * Uses `category_tree.csv`
+   * Fills candidate gaps using category neighbors
+
+4. **Configurable Retrieval Width**
+
+   * Top 50 candidates
+   * Extended to Top 100 after bottleneck diagnosis
+
+---
+
+## Stage 2 — Learning-to-Rank
+
+A Logistic Regression model re-scores candidates using:
+
+* `item_similarity_score`
+* `item_popularity`
+* `time_since_last_interaction`
+* `user_history_count` ✅
+* `item_interaction_count` ✅
+
+The last two features allow the model to:
+
+* Detect cold vs warm users
+* Adjust behavior dynamically
+* Avoid over-correcting similarity signals
+
+Interaction weights are used only for **sample weighting**, not as features (to avoid leakage).
+
+---
+
+# 4. Interaction Modeling
+
+Implicit feedback is constructed using weighted event signals:
 
 ```python
 EVENT_WEIGHT = {
@@ -93,348 +124,215 @@ EVENT_WEIGHT = {
     "addtocart": 3.0,
     "transaction": 5.0
 }
-````
+```
 
-Raw events are aggregated at the **(user_id, item_id)** level by:
+Events are aggregated at the `(user_id, item_id)` level:
 
-* Summing event weights → `interaction_score`
-* Preserving the most recent timestamp → `last_interaction_ts`
+* `interaction_score` (sum of weights)
+* `last_interaction_ts` (most recent timestamp)
 
-### Final Interaction Schema
-
-| Column              | Description                       |
-| ------------------- | --------------------------------- |
-| user_id             | Unique user identifier            |
-| item_id             | Unique item identifier            |
-| interaction_score   | Strength of implicit feedback     |
-| last_interaction_ts | Most recent interaction timestamp |
-
-This interaction table is the **single source of truth** for all downstream models.
+This forms the single source of truth for training.
 
 ---
 
-## Why Implicit Feedback Is Necessary
+# 5. Train/Test Split
 
-In real-world recommender systems:
+Data is split **by time**:
 
-* Explicit ratings are rare or unavailable
-* Most users never provide direct feedback
-* Behavioral data is abundant and passive
+* First 80% → Train
+* Last 20% → Test
 
-Implicit feedback is necessary because:
+This ensures:
 
-* It captures **natural user behavior**
-* Interaction frequency and intensity correlate with intent
-* It scales to millions of users without friction
-* It reflects how production systems actually operate
-
-The system learns from **what users do**, not what they claim.
+* No future leakage
+* Realistic next-item prediction
 
 ---
 
-## Train/Test Split Strategy
+# 6. Evaluation Metrics
 
-To avoid data leakage, interactions are split **by time**:
+Evaluated per user using:
 
-* **Train:** first 80% of interactions (earliest timestamps)
-* **Test:** last 20% of interactions (future behavior)
-
-This simulates a real-world scenario:
-
-> *Predict future user interactions using only past data.*
-
----
-
-## Evaluation Metrics
-
-Models are evaluated **offline** using:
-
-* **Precision@10**
 * **Recall@10**
+* **NDCG@10**
 
-Evaluation is performed **per test user**, answering:
+Recall answers:
 
-> **“Out of what users actually interacted with later, how many did we surface?”**
+> Did we include the correct item?
+
+NDCG answers:
+
+> Did we rank it high?
 
 ---
 
-## Baseline Recommender: Popularity Model
+# 7. Baseline Performance
 
-### Model Definition
+## Popularity Model
 
-The popularity-based baseline:
+| Metric    | Value  |
+| --------- | ------ |
+| Recall@10 | 0.0075 |
+| NDCG@10   | 0.0039 |
 
-* Ranks items by total `interaction_score` in the **training set**
-* Excludes items already interacted with by the user
-* Recommends the top-K remaining items (K = 10)
+---
 
-This model provides a **lower bound** for performance and validates the evaluation pipeline.
+## Item–Item CF
 
-### Results (Popularity Baseline)
+| Metric    | Value  |
+| --------- | ------ |
+| Recall@10 | 0.0096 |
+| NDCG@10   | 0.0053 |
+
+Modest improvement, but heavily constrained by cold-start dominance.
+
+---
+
+# 8. Ranker Ablation Study
+
+| Model Variant               | Recall@10 | NDCG@10 |
+| --------------------------- | --------- | ------- |
+| Popularity                  | 0.0075    | 0.0039  |
+| Item-Item CF                | 0.0096    | 0.0053  |
+| CF + LR (no count features) | 0.0088    | 0.0048  |
+| CF + LR (+ count features)  | 0.0102    | 0.0058  |
+
+### Impact of Count Features
+
+| Metric    | Improvement |
+| --------- | ----------- |
+| Recall@10 | +16.0%      |
+| NDCG@10   | +22.2%      |
+
+Without count features, the ranker harms performance.
+With count features, the ranker becomes additive.
+
+---
+
+# 9. System Bottleneck Diagnosis
+
+This project explicitly measures candidate reachability.
+
+## Candidate Recall@50 (Behavior Only)
 
 ```
-Precision@10: 0.00084
-Recall@10:    0.00748
-Test users:   302,356
+0.0240
 ```
 
-These results are **expected and correct** given:
+This means:
 
-* Extremely sparse user behavior
-* Large item catalog
-* No personalization
-* Heavy popularity bias
+> The correct item is not even visible 97.6% of the time.
 
----
-
-## Item-Based Collaborative Filtering
-
-### Model Overview
-
-To introduce personalization while remaining defensible under sparsity, the project implements an **item–item collaborative filtering model** based on **co-occurrence similarity**.
-
-### How It Works
-
-1. For each user, collect all interacted items
-2. Generate all item–item pairs within each user
-3. Count co-occurrences across users
-4. Normalize using **cosine similarity**
-
-[
-\text{sim}(i, j) = \frac{\text{cooc}(i, j)}{\sqrt{\text{count}(i) \cdot \text{count}(j)}}
-]
-
-This captures **behavioral similarity** while reducing popularity bias.
+Ranking cannot recover what retrieval does not surface.
 
 ---
 
-## Candidate Generation Logic
+## After Taxonomy Augmentation
 
-For a given user:
-
-1. Retrieve items from the user’s interaction history
-2. Retrieve similar items for each history item
-3. Aggregate similarity scores
-4. Rank candidate items
-5. Exclude previously seen items
-
----
-
-## Cold-Start Handling (Explicit)
-
-Cold-start is handled **explicitly in code**, not implicitly:
-
-### User Cold-Start
-
-* If a user has **no training history**
-* Fallback → popularity-based recommendations
-
-### Item Cold-Start
-
-* If an item has **no neighbors in the similarity matrix**
-* Fallback → popularity-based recommendations
-
-Cold-start is treated as the **dominant real-world case**, not an edge case.
-
----
-
-## Results: Item-Based Collaborative Filtering
+Candidate Recall@50:
 
 ```
-Precision@10:        0.00119
-Recall@10:           0.00958
-Test users:          302,356
-Cold-start users:    280,190
-Items with neighbors:138,131
+0.0249
 ```
 
-### Interpretation
+Small improvement (~3.75%).
 
-* Item-based CF **outperforms popularity**
-* Gains are modest but **statistically meaningful**
-* Cold-start dominates evaluation
-* Improvements are constrained by extreme sparsity
-
-These results confirm:
-
-> **Item-to-item similarity is more defensible than user embeddings under sparse implicit feedback.**
+Taxonomy improves semantic coverage more than exact item ID recovery.
 
 ---
 
-## Key Observations from EDA
+## After Increasing Retrieval Width to 100
 
-* Majority of users have **only one interaction**
-* User–item matrix is extremely sparse
-* Cold-start is the norm, not the exception
-* Popularity dominates without personalization
+Candidate Recall@100:
 
-These findings strongly motivate:
+```
+0.0362
+```
 
-* Item-to-item methods
-* Session-based recommendation
-* Hybrid retrieval strategies
+This raises the theoretical Recall@10 ceiling by ~50%.
 
----
+This confirms:
 
-## Known Limitations
-
-Implicit feedback models have inherent constraints:
-
-* No explicit negative signals
-* Missing interactions ≠ dislike
-* Exposure bias favors popular items
-* Single-interaction users limit personalization
-
-As a result:
-
-* Recall remains low
-* Long-tail discovery is difficult
-* Gains require stronger signals or context
-
-These limitations are **intentional and instructional** at this stage 1.
+> Retrieval width was the dominant bottleneck.
 
 ---
 
-# Stage 2 - Logistic Regression Training Summary
+# 10. Final Performance (After Retrieval Expansion)
 
-- Training rows: **12,013,001**
-- Validation AUC: **0.7803**
-- Validation Log Loss: **0.3869**
+| Model                    | Recall@10  | NDCG@10    |
+| ------------------------ | ---------- | ---------- |
+| Popularity               | 0.0075     | 0.0039     |
+| Item-Item CF             | 0.0096     | 0.0053     |
+| CF + LR Ranker (Top 100) | **0.0111** | **0.0062** |
 
-Learned coefficients:
+Improvement achieved **without modifying the ranker** — purely by expanding retrieval.
 
-| Feature | Coefficient |
-|----------|------------|
-| item_similarity_score | 0.1273 |
-| item_popularity | 0.9692 |
-| time_since_last_interaction | -0.0054 |
+This confirms that:
 
-(Counts added later in improved model.)
+> Candidate generation was the primary system constraint.
 
 ---
 
-# A. Ablation Study — Do Count Features Matter?
+# 11. Cold-Start Reality
 
-Test Set: **302,356 users**
+* 302,356 test users
+* 280,190 cold-start users (~92%)
 
-## Comparison Table
+Most ranking decisions occur under minimal personalization signal.
 
-| Model Variant | Recall@10 | NDCG@10 |
-|---------------|-----------|----------|
-| Popularity | 0.0075 | 0.0039 |
-| Item-Item CF | 0.0096 | 0.0053 |
-| CF + LR Ranker (no count features) | 0.0088 | 0.0048 |
-| CF + LR Ranker (+ count features) | **0.0102** | **0.0058** |
+Gains are therefore bounded by data structure, not model complexity.
 
 ---
 
-## Impact of Count Features (Ranker Only)
+# 12. Known Limitations
 
-Comparing Ranker **with vs without** counts:
+* No exposure logs (negatives are sampled)
+* No session-based modeling
+* No sequential dynamics
+* No personalization for single-interaction users
+* Exact-item matching evaluation penalizes category-level relevance
 
-| Metric | Improvement |
-|--------|-------------|
-| Recall@10 | **+16.0%** |
-| NDCG@10 | **+22.2%** |
-
-Without count features, the ranker *degrades* CF ordering.  
-With count features, the ranker becomes additive and surpasses CF.
-
-### Conclusion
-
-`user_history_count` and `item_interaction_count` are quantitatively necessary for:
-
-- Stabilizing ranking under sparse histories  
-- Calibrating popularity strength  
-- Preventing over-correction of similarity signals  
+These limitations are intentional and documented.
 
 ---
 
-# B. Failure Slice Analysis
+# 13. Key Engineering Takeaways
 
-### When the Ranker Helps
-
-✔️ **Warm Users (multiple historical interactions)**  
-- User has enough interaction depth  
-- Behavioral counts provide signal strength  
-- Ranker reorders CF candidates effectively  
-
-✔️ **Items with meaningful interaction volume**  
-- item_interaction_count helps calibrate confidence  
-- Reduces noise from weak co-occurrence edges  
-
-Result:  
-Ranker improves both Recall@10 and NDCG@10.
+1. Retrieval bottlenecks matter more than ranking sophistication.
+2. Count features stabilize ranking under sparse regimes.
+3. Increasing candidate width can outperform adding model complexity.
+4. Proper leakage control is essential.
+5. Most improvements in sparse systems come from handling cold-start correctly.
 
 ---
 
-### When the Ranker Cannot Help
+# 14. Future Improvements
 
-❌ **Extreme Cold Users (1 or 0 interactions)**  
-- user_history_count ≈ 0  
-- No personalization signal  
-- Candidate set already weak  
-- Ranker only reshuffles popularity
-
-❌ **Items with no co-occurrence neighbors**  
-- No similarity signal  
-- Falls back to popularity  
-
-Given that:
-
-- 302,356 total test users  
-- 280,190 are cold-start users (~92%)
-
-Most ranking decisions operate under severe sparsity.
+* Session-based next-item modeling
+* Time-decayed co-visitation weighting
+* Bayesian smoothing of item counts
+* Personalized popularity priors
+* Category-aware ranking features
+* Exposure-aware negative sampling
 
 ---
 
-# C. Brutal Honesty
-
-> With 92% cold users, ranking gains are bounded; most improvements come from better handling of sparse user histories rather than true personalization.
-
----
-
-# Key Takeaways
-
-1. Logistic Regression ranker is effective **only when behavioral intensity signals are included**.
-2. Count features transform the ranker from harmful to beneficial.
-3. Gains are real but fundamentally constrained by extreme cold-start distribution.
-4. Future improvements must focus on:
-   - Better candidate generation
-   - Cold-start modeling
-   - Regime-aware ranking strategies
-
----
-
-# Current Best Logistic Regression Performance
-
-| Model | Recall@10 | NDCG@10 |
-|--------|-----------|----------|
-| Item-Item CF | 0.0096 | 0.0053 |
-| Item-Item CF + LR Ranker (Improved) | **0.0102** | **0.0058** |
-
----
-
-# Next Steps
-
-- Add regime-aware ranking logic  
-- Explore XGBoost ranker comparison  
-- Segment evaluation by cold vs warm users  
-- Improve candidate generator quality  
-
----
-
-**Status:** Logistic Regression ranker validated with quantitative ablation evidence.  
-Further gains require improvements upstream in candidate generation.
+# 15. Project Philosophy
 
 This project prioritizes:
 
-* Correct temporal splits
+* Clear system decomposition
+* Honest bottleneck measurement
 * Transparent assumptions
 * Interpretable baselines
-* Scalable system design
+* Realistic evaluation
+* Practical scalability
+
+The goal is not to maximize metrics blindly.
+
+The goal is to understand **why the system behaves the way it does.**
 
 ---
 
-
+**Status:**
+Two-stage hybrid recommender system validated with retrieval expansion, ablation evidence, and bottleneck diagnosis under extreme sparsity.

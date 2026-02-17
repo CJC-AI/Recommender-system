@@ -22,6 +22,7 @@ FEATURE_COLUMNS = [
     "item_popularity",
     "item_interaction_count",
     "user_history_count",
+    "user_category_affinity",       # NEW: Personalization Signal
     "time_since_last_interaction",
     
 ]
