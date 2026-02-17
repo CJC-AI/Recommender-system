@@ -17,13 +17,24 @@ This project emphasizes **correct data handling, defensible baselines, and evalu
 Recommender-system/
 │
 ├── data/
-│   ├── raw/                 # Original events data
-│   └── processed/           # Aggregated interactions
-│
+│   ├── raw/                            # Original events data
+|   |   ├── category_tree.csv
+|   |   ├── events.csv
+|   |   ├── item_properties_part1.csv
+|   |   └── item_properties_part2.csv     
+│   └── processed/                      # Aggregated interactions
+│       ├── interactions.csv
+|       └── training_data.csv
+|
 ├── src/
-│   ├── interactions.py      # Interaction construction
+│   ├── ranking/
+|   |   ├── dataset.py
+|   |   ├── train_lr.py
+|   |   ├── train_xgb.py
+|   |   ├── infer.py
+|   |   └── evaluation.py      # Train/test split + metrics
 │   ├── candidate_generation.py
-│   └── evaluation.py        # Train/test split + metrics
+│   └── interactions.py        # Interaction construction
 │
 ├── notebooks/
 │   └── eda.ipynb            # Exploratory analysis

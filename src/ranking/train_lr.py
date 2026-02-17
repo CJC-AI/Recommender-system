@@ -2,106 +2,138 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
-from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score, log_loss, recall_score, precision_score
+from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import (roc_auc_score, log_loss, 
+                             classification_report)
 
-# --- Global Configuration ---
-TRAINING_DATA_PATH = "data/processed/training_data.csv"
-MODEL_OUTPUT_PATH  = "artifacts/models/lr_ranker.joblib"
+# -------------------------------------------------------
+# Configuration
+# -------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TRAINING_DATA_PATH = os.path.join(BASE_DIR, "data", "processed", "training_data.csv")
+MODEL_OUTPUT_PATH  = os.path.join(BASE_DIR, "artifacts", "models", "lr_ranker.joblib")
 
-# UPDATED FEATURES
+# THE FULL 6-FEATURE SET
 FEATURE_COLUMNS = [
     "item_similarity_score",
     "item_popularity",
-    "item_interaction_count",       # NEW
-    "user_history_count",           # NEW
-    "time_since_last_interaction",
+    "item_interaction_count",       
+    "user_history_count",           
+    "time_since_last_interaction",  
 ]
 
-VAL_FRACTION = 0.1 # Holds out the most recent 10% of data for validation
-
-def load_and_split(path: str = TRAINING_DATA_PATH, val_fraction: float = VAL_FRACTION):
+# -------------------------------------------------------
+# Load & Split
+# -------------------------------------------------------
+def load_and_prep(path: str = TRAINING_DATA_PATH):
     """
-    Loads processed training data and performs a temporal split.
-    
-    Args:
-        path (str): Path to the CSV training data.
-        val_fraction (float): Percentage of data to use for validation.
-        
-    Returns:
-        tuple: (train_df, val_df)
+    Load data, handle weights, and split.
     """
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Training data not found at {path}. Run dataset.py first.")
-
+        raise FileNotFoundError(f"Training data not found at {path}")
+        
     df = pd.read_csv(path)
     print(f"Loaded {len(df):,} rows.")
-
-    # Split is positional rather than random to respect the time-series nature of logs
-    split_idx = int(len(df) * (1 - val_fraction))
-    train_df = df.iloc[:split_idx].copy()
-    val_df   = df.iloc[split_idx:].copy()
-
-    return train_df, val_df
-
-def train_lr(train_df: pd.DataFrame) -> Pipeline:
-    """
-    Builds and trains a scikit-learn Pipeline for ranking.
     
-    Logic:
-    1. Scales features using StandardScaler (required for Logistic Regression convergence).
-    2. Applies sample weights (Purchases = 5x weight of a View).
-    3. Fits a binary classifier to predict P(interaction).
-    """
-    X = train_df[FEATURE_COLUMNS].values
-    y = train_df["label"].values
+    # Check for missing columns
+    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Training data is missing columns: {missing}. Re-run dataset.py!")
 
-    # BLOCK: Sample Weighting
-    # We treat every training row with a label of 0 (negative) as a weight of 1.0.
-    # Positive interactions (label 1) use their original interaction_type_weight.
-    weights = train_df["interaction_type_weight"].values.copy()
+    X = df[FEATURE_COLUMNS]
+    y = df["label"]
+
+    # Sample Weights: Negatives (0.0) -> 1.0, Positives -> Original Weight (1, 3, 5)
+    weights = df["interaction_type_weight"].values.copy()
     weights[weights == 0] = 1.0
 
-    # Build the Pipeline to ensure scaling is applied during both fit and predict
-    pipeline = Pipeline([
+    # Stratified Split
+    X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
+        X, y, weights, test_size=0.1, stratify=y, random_state=42
+    )
+
+    print(f"  Train: {len(X_train):,} | Val: {len(X_val):,}")
+    return X_train, X_val, y_train, y_val, w_train, w_val
+
+# -------------------------------------------------------
+# Train
+# -------------------------------------------------------
+def train_lr(X_train, y_train, w_train):
+    """
+    Train Logistic Regression with Scaling.
+    """
+    print("\nTraining Logistic Regression Ranker...")
+    
+    # Pipeline: Scale features -> LogReg
+    # Scaling is MANDATORY because 'item_interaction_count' (0-1000s) 
+    # has a vastly different scale than 'item_popularity' (0-1).
+    pipe = Pipeline([
         ('scaler', StandardScaler()),
         ('model', LogisticRegression(
+            solver='lbfgs', 
             max_iter=1000, 
-            # --- FIX C: Simplify Weights ---
-            # Removed class_weight="balanced" to avoid double-weighting.
-            # We rely purely on the 'weights' array (View=1 vs Purchase=5) passed to fit().
             random_state=42
         ))
     ])
-
-    # Fit the model specifically passing weights to the 'model' step of the pipeline
-    pipeline.fit(X, y, model__sample_weight=weights)
     
-    # Extract model to print coefficients for verification
-    model = pipeline.named_steps['model']
-    print("LogisticRegression trained.")
-    print(f"  Coefficients: {dict(zip(FEATURE_COLUMNS, model.coef_[0].round(4)))}")
-    print(f"  Intercept:    {model.intercept_[0]:.4f}")
+    pipe.fit(X_train, y_train, model__sample_weight=w_train)
     
-    return pipeline
+    print("Training Complete.")
+    return pipe
 
-def evaluate_lr(pipeline: Pipeline, val_df: pd.DataFrame):
-    """Calculates ranking-relevant classification metrics on the validation set."""
-    X_val = val_df[FEATURE_COLUMNS].values
-    y_val = val_df["label"].values
-    y_prob = pipeline.predict_proba(X_val)[:, 1]
-    print(f"\nValidation AUC: {roc_auc_score(y_val, y_prob):.4f}")
-    print(f"Validation Log Loss: {log_loss(y_val, y_prob):.4f}")
+# -------------------------------------------------------
+# Evaluate
+# -------------------------------------------------------
+def evaluate_model(model, X_val, y_val):
+    """
+    Evaluate AUC and print coefficients (Feature Importance).
+    """
+    y_prob = model.predict_proba(X_val)[:, 1]
+    y_pred = (y_prob >= 0.5).astype(int)
 
-def save_model(pipeline: Pipeline, path: str = MODEL_OUTPUT_PATH):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    joblib.dump(pipeline, path)
-    print(f"Model saved to {path}")
+    auc = roc_auc_score(y_val, y_prob)
+    logloss = log_loss(y_val, y_prob)
+    
+    print("\n" + "="*40)
+    print("FINAL VALIDATION METRICS")
+    print("="*40)
+    print(f"  AUC:       {auc:.4f}")
+    print(f"  Log Loss:  {logloss:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(y_val, y_pred))
 
+    # Print Coefficients (Linear Feature Importance)
+    print("\nFeature Coefficients (Importance):")
+    print("-" * 30)
+    
+    # Extract coefficients from the inner model
+    coeffs = model.named_steps['model'].coef_[0]
+    feature_imp = pd.DataFrame({
+        'Feature': FEATURE_COLUMNS,
+        'Coefficient': coeffs,
+        'Abs_Coeff': np.abs(coeffs)
+    }).sort_values(by='Abs_Coeff', ascending=False)
+    
+    print(feature_imp[['Feature', 'Coefficient']])
+
+# -------------------------------------------------------
+# Main Execution
+# -------------------------------------------------------
 if __name__ == "__main__":
-    train, val = load_and_split()
-    model = train_lr(train)
-    evaluate_lr(model, val)
-    save_model(model)
+    # 1. Load
+    X_train, X_val, y_train, y_val, w_train, w_val = load_and_prep()
+    
+    # 2. Train
+    model = train_lr(X_train, y_train, w_train)
+    
+    # 3. Evaluate
+    evaluate_model(model, X_val, y_val)
+    
+    # 4. Save
+    os.makedirs(os.path.dirname(MODEL_OUTPUT_PATH), exist_ok=True)
+    joblib.dump(model, MODEL_OUTPUT_PATH)
+    print(f"\nModel saved to {MODEL_OUTPUT_PATH}")

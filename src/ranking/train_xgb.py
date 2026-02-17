@@ -30,13 +30,12 @@ FEATURE_COLUMNS = [
 XGB_PARAMS = {
     "n_estimators": 300,
     "learning_rate": 0.05,
-    "max_depth": 6,              # Deep enough to capture non-linear interaction
+    "max_depth": 7,              # Deep enough to capture non-linear interaction
     "subsample": 0.8,            # Prevent overfitting
     "colsample_bytree": 0.8,
     "objective": "binary:logistic",
     "eval_metric": "auc",
-    "random_state": 42,
-    "n_jobs": -1                 # Use all CPU cores
+    "random_state": 42
 }
 
 # -------------------------------------------------------

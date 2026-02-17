@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import math
 import os
-from typing import Dict, Set
+from typing import Dict, Set, Optional, Any
 
 from src.candidate_generation import (
     compute_item_popularity,
@@ -10,6 +10,8 @@ from src.candidate_generation import (
     recommend_item_based,
     build_cooccurrence_matrix,
 )
+# NEW: Import for taxonomy-aware evaluation
+from src.taxonomy import TaxonomyEngine
 
 # -------------------------------------------------------
 # Time-Based Split
@@ -19,6 +21,9 @@ def time_based_split(
     timestamp_col: str = "last_interaction_ts",
     train_ratio: float = 0.8,
 ):
+    """
+    Sorts by time and splits the last 20% of interactions into the test set.
+    """
     interactions = interactions.sort_values(timestamp_col).reset_index(drop=True)
     split_index  = int(len(interactions) * train_ratio)
     train = interactions.iloc[:split_index].copy()
@@ -73,7 +78,7 @@ def evaluate_popularity_model(train: pd.DataFrame, test: pd.DataFrame, k: int = 
 
 
 # -------------------------------------------------------
-# Evaluation: Item-Item CF
+# Evaluation: Item-Item CF (Updated)
 # -------------------------------------------------------
 def evaluate_item_based_model(
     train: pd.DataFrame,
@@ -81,7 +86,11 @@ def evaluate_item_based_model(
     k: int = 10,
     candidates_per_item: int = 50,
     min_cooccurrence: int = 2,
+    taxonomy_engine: Optional[Any] = None, # NEW: Accept taxonomy engine
 ) -> dict:
+    """
+    Evaluates Item-Item CF, optionally augmented by Taxonomy Backfill.
+    """
     print("  Building co-occurrence matrix …")
     similarity_matrix = build_cooccurrence_matrix(train, min_cooccurrence=min_cooccurrence)
     print(f"  {len(similarity_matrix):,} items with neighbours")
@@ -93,16 +102,29 @@ def evaluate_item_based_model(
 
     recalls, ndcgs = [], []
     cold_start_users = 0
-    for user_id, relevant in test_history.items():
+    
+    total_users = len(test_history)
+    print(f"  Evaluating on {total_users} users...")
+
+    for i, (user_id, relevant) in enumerate(test_history.items()):
         if not relevant: continue
         seen = train_history.get(user_id, set())
         if not seen: cold_start_users += 1
         
+        # UPDATED: Pass taxonomy_engine to recommendation logic
         recs = recommend_item_based(
-            seen, similarity_matrix, top_popular_items, k=k, candidates_per_item=candidates_per_item
+            seen, 
+            similarity_matrix, 
+            top_popular_items, 
+            k=k, 
+            candidates_per_item=candidates_per_item,
+            taxonomy_engine=taxonomy_engine # Pass the engine down
         )
         recalls.append(recall_at_k(recs, relevant))
         ndcgs.append(ndcg_at_k(recs, relevant, k))
+        
+        if (i + 1) % 50000 == 0:
+            print(f"  Processed {i+1} users...")
 
     return {
         "Recall@10":            np.mean(recalls) if recalls else 0.0,
@@ -157,11 +179,50 @@ def evaluate_ranked_model(
 
 
 # -------------------------------------------------------
+# Candidate Coverage (Updated)
+# -------------------------------------------------------
+
+def compute_candidate_coverage(interactions: pd.DataFrame):
+    """
+    Computes Recall@50 for the Candidate Generator with Taxonomy Augmentation.
+    """
+    print("Loading interactions...")
+    
+    # 1. Split Data (Same split as training)
+    train, test = time_based_split(interactions)
+    
+    # 2. Initialize Taxonomy Engine
+    print("Initializing Taxonomy Engine...")
+    tex = TaxonomyEngine(train)
+    
+    # 3. Evaluate Candidate Generator @ 50
+    print("\nComputing Candidate Recall@50 (with Taxonomy)...")
+    
+    # We set k=50 to simulate the candidate pool size
+    metrics = evaluate_item_based_model(
+        train, 
+        test, 
+        k=100,                  # <--- Simulates the pool size passed to Ranker
+        candidates_per_item=50,
+        taxonomy_engine=tex    # <--- Enable Taxonomy Backfill
+    )
+    
+    coverage = metrics['Recall@10'] # Returns key 'Recall@10' but value is actually Recall@50
+    
+    print("\n" + "="*40)
+    print("TAXONOMY-AUGMENTED CANDIDATE COVERAGE")
+    print("="*40)
+    print(f"Candidate Recall@50:  {coverage:.4f}")
+    print(f"Max Theoretical Ranker Recall: {coverage:.4f}")
+    print("="*40)
+
+
+# -------------------------------------------------------
 # Side-by-side comparison
 # -------------------------------------------------------
 def compare_models(
     interactions: pd.DataFrame,
-    model_path: str = "artifacts/models/lr_ranker.joblib",
+    model_path: str,
     k: int = 10,
 ) -> dict:
     train, test = time_based_split(interactions)
@@ -197,38 +258,3 @@ def compare_models(
         "item_based": cf_metrics,
         "ranked":     ranked_metrics,
     }
-
-
-# -------------------------------------------------------
-# Candidate Coverage
-# -------------------------------------------------------
-
-def compute_candidate_coverage(interactions: pd.DataFrame):
-    
-    print("Loading interactions...")
-    
-    # 1. Split Data (Same split as training)
-    train, test = time_based_split(interactions)
-    
-    # 2. Evaluate Candidate Generator @ 50
-    # We use the existing evaluation function but set k=50.
-    # Note: The function returns keys like 'Recall@10' hardcoded, 
-    # but since we passed k=50, the value is actually Recall@50.
-    print("\nComputing Candidate Recall@50...")
-    metrics = evaluate_item_based_model(
-        train, 
-        test, 
-        k=50,  # <--- The key parameter
-        candidates_per_item=50
-    )
-    
-    coverage = metrics['Recall@10'] # This is actually Recall@50 due to k=50
-    
-    print("\n" + "="*40)
-    print("CANDIDATE GENERATION PERFORMANCE")
-    print("="*40)
-    print(f"Candidate Recall@50:  {coverage:.4f}")
-    print(f"Maximum Possible Recall: {coverage:.4f}")
-    print("="*40)
-    print(f"Interpretation: The Ranker can theoretically achieve at most {coverage:.1%} recall.")
-    print("If this number is low, improve the Candidate Generator (Item-Item CF) first.")
