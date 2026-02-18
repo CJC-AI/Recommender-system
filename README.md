@@ -312,7 +312,6 @@ These limitations are intentional and documented.
 * Time-decayed co-visitation weighting
 * Bayesian smoothing of item counts
 * Personalized popularity priors
-* Category-aware ranking features
 * Exposure-aware negative sampling
 
 ---

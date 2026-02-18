@@ -3,15 +3,18 @@ import numpy as np
 import joblib
 import xgboost as xgb
 import os
-from typing import Dict, Set
+from typing import Dict, Set, Union, List
 
 from src.candidate_generation import (
     build_cooccurrence_matrix,
     compute_item_popularity,
     recommend_item_based,
 )
-from src.ranking.dataset import fast_compute_features
-# NEW: Import the Taxonomy Engine
+from src.ranking.dataset import (
+    fast_compute_features, 
+    load_item_metadata, 
+    build_user_category_profiles
+)
 from src.taxonomy import TaxonomyEngine
 
 
@@ -23,16 +26,16 @@ INTERACTIONS_PATH   = os.path.join(BASE_DIR, "data", "processed", "interactions.
 LR_MODEL_PATH       = os.path.join(BASE_DIR, "artifacts", "models", "lr_ranker.joblib")
 XGB_MODEL_PATH      = os.path.join(BASE_DIR, "artifacts", "models", "xgb_ranker.json")
 
-# Matches the 5-feature schema of your trained XGBoost model
+# 6 Features matching your trained models
 FEATURE_COLUMNS = [
     "item_similarity_score",
     "item_popularity",
     "item_interaction_count",       
     "user_history_count",           
+    "user_category_affinity",       
     "time_since_last_interaction",  
 ]
 
-# CRITICAL CHANGE: Increase candidate pool to 100 to leverage Taxonomy
 N_CANDIDATES = 100     
 K_FINAL      = 10      
 
@@ -43,7 +46,7 @@ K_FINAL      = 10
 class RankingContext:
     """
     Holds every pre-computed artifact needed to score candidates.
-    Now includes Taxonomy Engine for advanced retrieval.
+    Contains similarity matrix, taxonomy engine, item stats, and user history.
     """
 
     def __init__(self, train_df: pd.DataFrame, min_cooccurrence: int = 2):
@@ -62,8 +65,10 @@ class RankingContext:
         )
         print(f"  similarity_matrix: {len(self.similarity_matrix):,} items")
 
-        # 2. Taxonomy Engine (NEW)
+        # 2. Taxonomy & Metadata
         self.taxonomy_engine = TaxonomyEngine(train_df)
+        self.item_categories = load_item_metadata()
+        self.user_category_profiles = build_user_category_profiles(train_df, self.item_categories)
 
         # 3. Popularity & Stats
         pop_df = compute_item_popularity(train_df)
@@ -88,25 +93,29 @@ class RankingContext:
 # Load Model
 # -------------------------------------------------------
 def load_model(model_path: str):
+    """
+    Loads either a LogisticRegression (.joblib) or XGBoost (.json) model.
+    Returns a wrapper that exposes a consistent .score(X) method.
+    """
     class _ModelWrapper:
         def __init__(self, path: str):
             if path.endswith(".joblib"):
                 self._model = joblib.load(path)
-                if hasattr(self._model, 'named_steps'):
-                    lr_obj = self._model.named_steps['model']
-                else:
-                    lr_obj = self._model
-                if not hasattr(lr_obj, 'multi_class'):
-                    lr_obj.multi_class = 'auto' 
+                # Monkey patch for sklearn versions if needed
+                inner = self._model.named_steps['model'] if hasattr(self._model, 'named_steps') else self._model
+                if not hasattr(inner, 'multi_class'): inner.multi_class = 'auto'
                 self._kind = "lr"
             else:
                 self._model = xgb.Booster()
                 self._model.load_model(path)
                 self._kind = "xgb"
 
-        def score(self, X: np.ndarray) -> np.ndarray:
+        def score(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
             if self._kind == "lr":
+                # Scikit-learn Pipeline handles DataFrames natively
                 return self._model.predict_proba(X)[:, 1]
+            
+            # XGBoost handles DataFrames natively
             return self._model.predict(xgb.DMatrix(X, feature_names=FEATURE_COLUMNS))
 
     return _ModelWrapper(model_path)
@@ -121,27 +130,30 @@ def infer(
     model, 
     n_candidates: int = N_CANDIDATES, 
     k: int = K_FINAL
-) -> list[int]:
+) -> List[int]:
     """
     Full inference pipeline for a single user.
+    1. Generate candidates (CF + Taxonomy Backfill).
+    2. Compute 6 features for each candidate.
+    3. Score using Ranker.
+    4. Sort and return Top-K.
     """
     user_history = ctx.user_histories.get(user_id, set())
     user_last    = ctx.user_last_ts.get(user_id, pd.NaT)
 
-    # --- 1. Candidate generation (Updated) ---
-    # Now includes Taxonomy Backfill via ctx.taxonomy_engine
+    # 1. Candidate generation (CF + Taxonomy)
     candidates = recommend_item_based(
         user_history=user_history,
         similarity_matrix=ctx.similarity_matrix,
         top_popular_items=ctx.top_popular_items,
         k=n_candidates,
-        taxonomy_engine=ctx.taxonomy_engine # Pass the engine
+        taxonomy_engine=ctx.taxonomy_engine
     )
 
     if not candidates:
         return []
 
-    # --- 2. Feature computation ---
+    # 2. Feature computation
     now = ctx.max_train_ts
 
     feature_rows = [
@@ -154,23 +166,26 @@ def infer(
             user_last_ts         = user_last,
             similarity_matrix    = ctx.similarity_matrix,
             item_stats_dict      = ctx.item_stats_dict, 
+            item_categories      = ctx.item_categories,        # Pass metadata
+            user_category_profiles = ctx.user_category_profiles, # Pass profiles
             is_negative          = True, 
         )
         for item_id in candidates
     ]
 
     feature_df = pd.DataFrame(feature_rows)
-    # Ensure column order matches training
+    
+    # Pass DataFrame directly to preserve column names for Model (e.g. StandardScaler)
     X = feature_df[FEATURE_COLUMNS]
 
-    # --- 3. Score ---
+    # 3. Score
     try:
         scores = model.score(X)
     except Exception as e:
         print(f"Error during scoring for user {user_id}: {e}")
         return candidates[:k]
 
-    # --- 4. Sort ---
+    # 4. Sort
     feature_df["_score"] = scores
     top_k = feature_df.nlargest(k, "_score")["item_id"].tolist()
     return top_k
@@ -179,7 +194,8 @@ def infer(
 # -------------------------------------------------------
 # Batch Helper
 # -------------------------------------------------------
-def infer_batch(user_ids: list[int], ctx: RankingContext, model, n_candidates: int = N_CANDIDATES, k: int = K_FINAL) -> Dict[int, list[int]]:
+def infer_batch(user_ids: List[int], ctx: RankingContext, model, n_candidates: int = N_CANDIDATES, k: int = K_FINAL) -> Dict[int, List[int]]:
+    """Helper to run inference on a batch of users."""
     results = {}
     for i, uid in enumerate(user_ids):
         results[uid] = infer(uid, ctx, model, n_candidates, k)
@@ -188,13 +204,12 @@ def infer_batch(user_ids: list[int], ctx: RankingContext, model, n_candidates: i
     return results
 
 if __name__ == "__main__":
-    from src.ranking.evaluation import time_based_split
     if os.path.exists(INTERACTIONS_PATH) and os.path.exists(LR_MODEL_PATH):
         interactions = pd.read_csv(INTERACTIONS_PATH)
-        train, _test = time_based_split(interactions)
-        ctx = RankingContext(train)
+        # Smoke test
+        ctx = RankingContext(interactions.head(1000)) 
         model = load_model(LR_MODEL_PATH)
-        sample_users = train["user_id"].unique()[:5].tolist()
-        for uid in sample_users:
-            recs = infer(uid, ctx, model)
-            print(f"  user {uid} → {recs}")
+        print(f"Model loaded. Expecting {len(FEATURE_COLUMNS)} features.")
+        sample_user = interactions["user_id"].iloc[0]
+        recs = infer(sample_user, ctx, model)
+        print(f"User {sample_user} recommendations: {recs}")
