@@ -31,7 +31,9 @@ This project is designed to measure and diagnose those limits clearly.
 
 # 2. Project Structure
 
+
 ```
+
 Recommender-system/
 │
 ├── data/
@@ -48,6 +50,9 @@ Recommender-system/
 ├── src/
 │   ├── interactions.py
 │   ├── candidate_generation.py
+│   ├── taxonomy.py               # Category-aware backfill engine
+│   ├── analysis/
+│   │   └── failure_analysis.py   # Diagnostics for model disagreement
 │   ├── ranking/
 │   │   ├── dataset.py
 │   │   ├── train_lr.py
@@ -59,6 +64,7 @@ Recommender-system/
 │   └── eda.ipynb
 │
 └── README.md
+
 ```
 
 ---
@@ -85,7 +91,7 @@ Candidates are generated using:
 3. **Taxonomy Augmentation**
 
    * Uses `category_tree.csv`
-   * Fills candidate gaps using category neighbors
+   * Fills candidate gaps using category neighbors when CF is sparse
 
 4. **Configurable Retrieval Width**
 
@@ -96,19 +102,14 @@ Candidates are generated using:
 
 ## Stage 2 — Learning-to-Rank
 
-A Logistic Regression model re-scores candidates using:
+Multiple rankers were trained (Logistic Regression vs. XGBoost). The final deployed model uses **Logistic Regression** based on failure analysis results.
 
-* `item_similarity_score`
-* `item_popularity`
-* `time_since_last_interaction`
-* `user_history_count` ✅
-* `item_interaction_count` ✅
-
-The last two features allow the model to:
-
-* Detect cold vs warm users
-* Adjust behavior dynamically
-* Avoid over-correcting similarity signals
+**Features Engineered:**
+* `item_similarity_score` (Behavioral signal)
+* `user_category_affinity` (Semantic signal)
+* `item_interaction_count` (Global confidence signal)
+* `user_history_count` (User maturity signal)
+* `time_since_last_interaction` (Temporal decay)
 
 Interaction weights are used only for **sample weighting**, not as features (to avoid leakage).
 
@@ -124,6 +125,7 @@ EVENT_WEIGHT = {
     "addtocart": 3.0,
     "transaction": 5.0
 }
+
 ```
 
 Events are aggregated at the `(user_id, item_id)` level:
@@ -170,19 +172,19 @@ NDCG answers:
 
 ## Popularity Model
 
-| Metric    | Value  |
-| --------- | ------ |
+| Metric | Value |
+| --- | --- |
 | Recall@10 | 0.0075 |
-| NDCG@10   | 0.0039 |
+| NDCG@10 | 0.0039 |
 
 ---
 
 ## Item–Item CF
 
-| Metric    | Value  |
-| --------- | ------ |
+| Metric | Value |
+| --- | --- |
 | Recall@10 | 0.0096 |
-| NDCG@10   | 0.0053 |
+| NDCG@10 | 0.0053 |
 
 Modest improvement, but heavily constrained by cold-start dominance.
 
@@ -190,19 +192,19 @@ Modest improvement, but heavily constrained by cold-start dominance.
 
 # 8. Ranker Ablation Study
 
-| Model Variant               | Recall@10 | NDCG@10 |
-| --------------------------- | --------- | ------- |
-| Popularity                  | 0.0075    | 0.0039  |
-| Item-Item CF                | 0.0096    | 0.0053  |
-| CF + LR (no count features) | 0.0088    | 0.0048  |
-| CF + LR (+ count features)  | 0.0102    | 0.0058  |
+| Model Variant | Recall@10 | NDCG@10 |
+| --- | --- | --- |
+| Popularity | 0.0075 | 0.0039 |
+| Item-Item CF | 0.0096 | 0.0053 |
+| CF + LR (no count features) | 0.0088 | 0.0048 |
+| CF + LR (+ count features) | 0.0102 | 0.0058 |
 
 ### Impact of Count Features
 
-| Metric    | Improvement |
-| --------- | ----------- |
-| Recall@10 | +16.0%      |
-| NDCG@10   | +22.2%      |
+| Metric | Improvement |
+| --- | --- |
+| Recall@10 | +16.0% |
+| NDCG@10 | +22.2% |
 
 Without count features, the ranker harms performance.
 With count features, the ranker becomes additive.
@@ -217,6 +219,7 @@ This project explicitly measures candidate reachability.
 
 ```
 0.0240
+
 ```
 
 This means:
@@ -233,6 +236,7 @@ Candidate Recall@50:
 
 ```
 0.0249
+
 ```
 
 Small improvement (~3.75%).
@@ -247,6 +251,7 @@ Candidate Recall@100:
 
 ```
 0.0362
+
 ```
 
 This raises the theoretical Recall@10 ceiling by ~50%.
@@ -257,23 +262,51 @@ This confirms:
 
 ---
 
-# 10. Final Performance (After Retrieval Expansion)
+# 10. Final Performance Comparison
 
-| Model                    | Recall@10  | NDCG@10    |
-| ------------------------ | ---------- | ---------- |
-| Popularity               | 0.0075     | 0.0039     |
-| Item-Item CF             | 0.0096     | 0.0053     |
-| CF + LR Ranker (Top 100) | **0.0111** | **0.0062** |
+We compared a linear baseline (Logistic Regression) against a non-linear tree ensemble (XGBoost).
 
-Improvement achieved **without modifying the ranker** — purely by expanding retrieval.
+| Model | Recall@10 | NDCG@10 |
+| --- | --- | --- |
+| Popularity | 0.0075 | 0.0039 |
+| Item-Item CF | 0.0096 | 0.0053 |
+| CF + XGBoost (Top 100) | 0.0056 | 0.0034 |
+| **CF + LR Ranker (Top 100)** | **0.0113** | **0.0063** |
 
-This confirms that:
-
-> Candidate generation was the primary system constraint.
+**Winner:** Logistic Regression.
 
 ---
 
-# 11. Cold-Start Reality
+# 11. Failure Analysis: The "AUC Illusion"
+
+Why did XGBoost fail despite having higher AUC (0.87) compared to LR (0.80)?
+
+### Diagnosis
+
+We ran a `failure_analysis.py` script to inspect disagreements between the models.
+
+1. **The Safety Trap:**
+* XGBoost learned that low `item_interaction_count` strongly predicts a "non-click."
+* It systematically suppressed "niche" items (high similarity, low volume) in favor of safe, moderately popular items.
+* In a ranking task, finding the specific niche item is the goal; suppressing it maximizes AUC but kills Recall.
+
+
+2. **Shortcut Learning:**
+* XGBoost over-indexed on `user_category_affinity`.
+* It effectively learned: "If the category matches, score it high."
+* This ignored the finer-grained `item_similarity_score`, causing it to recommend *any* item from the right category rather than the *specific* item the user viewed.
+
+
+3. **Linearity as a Feature:**
+* Logistic Regression is additive: `Score = (0.25 * Similarity) + (0.90 * Popularity)`.
+* A very strong Similarity signal can mathematically override a weak Popularity signal.
+* This property is crucial for sparse/long-tail recommendation, where the best item often has low global popularity.
+
+
+
+---
+
+# 12. Cold-Start Reality
 
 * 302,356 test users
 * 280,190 cold-start users (~92%)
@@ -284,7 +317,7 @@ Gains are therefore bounded by data structure, not model complexity.
 
 ---
 
-# 12. Known Limitations
+# 13. Known Limitations
 
 * No exposure logs (negatives are sampled)
 * No session-based modeling
@@ -296,27 +329,26 @@ These limitations are intentional and documented.
 
 ---
 
-# 13. Key Engineering Takeaways
+# 14. Key Engineering Takeaways
 
-1. Retrieval bottlenecks matter more than ranking sophistication.
-2. Count features stabilize ranking under sparse regimes.
-3. Increasing candidate width can outperform adding model complexity.
-4. Proper leakage control is essential.
-5. Most improvements in sparse systems come from handling cold-start correctly.
-
----
-
-# 14. Future Improvements
-
-* Session-based next-item modeling
-* Time-decayed co-visitation weighting
-* Bayesian smoothing of item counts
-* Personalized popularity priors
-* Exposure-aware negative sampling
+1. **High AUC  Good Ranking.** A model can be excellent at classifying negatives (AUC) while being terrible at sorting positives (NDCG).
+2. **Linear models often beat trees in sparse regimes.** Their additive nature forces them to respect weak signals (like similarity) that trees might gate out as "noise."
+3. **Retrieval bottlenecks dominate.** Increasing candidate width from 50 to 100 provided a larger gain than any modeling change.
+4. **Feature Engineering > Model Complexity.** Adding `user_category_affinity` and `counts` mattered more than switching to XGBoost.
 
 ---
 
-# 15. Project Philosophy
+# 15. Future Improvements
+
+* Session-based next-item modeling (RNN/Transformer) to capture sequence.
+* Time-decayed co-visitation weighting.
+* Bayesian smoothing of item counts.
+* Personalized popularity priors.
+* Exposure-aware negative sampling.
+
+---
+
+# 16. Project Philosophy
 
 This project prioritizes:
 
@@ -334,4 +366,6 @@ The goal is to understand **why the system behaves the way it does.**
 ---
 
 **Status:**
-Two-stage hybrid recommender system validated with retrieval expansion, ablation evidence, and bottleneck diagnosis under extreme sparsity.
+Two-stage hybrid recommender system validated. **Logistic Regression selected for deployment** after diagnostics proved XGBoost over-optimized for safety over relevance.
+
+```
