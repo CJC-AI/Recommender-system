@@ -161,7 +161,7 @@ def fast_compute_features(
 # -------------------------------------------------------
 def build_training_data(
     train_df: pd.DataFrame,
-    sample_users_frac: float = 1.0, 
+    sample_users_frac: float = 0.1, 
     sample_items_top_n: int = 5000,    
     n_negatives: int = 6,              
     min_cooccurrence: int = 2,
@@ -174,6 +174,7 @@ def build_training_data(
     1. Hard Negatives: Items similar to user's history (Candidate Gen output).
     2. Category Negatives: Items from the SAME category as the positive sample.
     3. Popular Negatives: High-traffic items.
+    4. Exclusion: Items user interacted with in Past OR Future.
     """
     
     print(f"Building TRAINING data with Category Negatives...")
@@ -208,6 +209,8 @@ def build_training_data(
     pop_df = compute_item_popularity(train_df)
     
     # Compute maximums for normalization (0.0 - 1.0 range)
+    # Ensure count feature play nicely with linear models if unscaled,
+    # and keeps feature magnitudes consistent.
     max_score = pop_df["interaction_score"].max() if not pop_df.empty else 1.0
     max_count = pop_df["interaction_count"].max() if not pop_df.empty else 1.0
 
@@ -219,7 +222,14 @@ def build_training_data(
             'count': row.interaction_count / max_count
         }
     
+    # Top N universe for popular sampling
+    #popular_items_universe = pop_df.head(sample_items_top_n)["item_id"].values
+
+    # All items univers for popular sampling (backup if top N is too restrictive)
     all_items_universe = pop_df["item_id"].values 
+
+    # GLOBAL History (Past + Future) for strict exclusions
+    # We must not sample an item as negative if the user will interact with it later
     user_global_history = train_df.groupby("user_id")["item_id"].apply(set).to_dict()
 
     # Load Metadata & Build Profiles
@@ -274,20 +284,29 @@ def build_training_data(
         # --- STRATEGY: 2 Hard, 2 Category, 2 Popular ---
         
         # 1. Hard Negatives (Similarity-based)
+        # Look at items similar to what the user has recently seen
         hard_candidates = set()
         if current_history:
+            # Sample up to 3 recent items to find neighbors for 
+            # (Converting set to list is 0(N), but history is usually small)
             seed_items = rng.choice(list(current_history), size=min(len(current_history), 3), replace=False)
             for seed in seed_items:
                 neighbors = similarity_matrix.get(seed, {})
+                # Add top neighbor as hard negative candidates
                 if neighbors:
+                    # Sort by similarity and take 5 per seed
                     sorted_neighbors = sorted(neighbors, key=neighbors.get, reverse=True)[:5]
                     hard_candidates.update(sorted_neighbors)
         
+        # Try to fill half the quota with Hard Negatives
         hard_quota = 2
         hard_candidates_list = list(hard_candidates)
         rng.shuffle(hard_candidates_list)
+
         for cand in hard_candidates_list:
             if len(selected_negatives) >= hard_quota: break
+
+            # Strict Exclusion: Not in Past, Current, or Future
             if cand not in full_history_exclusion and cand != i_id:
                 selected_negatives.append(cand)
 
@@ -308,11 +327,13 @@ def build_training_data(
                         selected_negatives.append(cand)
 
         # 3. General Negatives (Popularity-based) -> Fill the rest
+        # Sample more than needed to account for collisions
         needed = n_negatives - len(selected_negatives)
         if needed > 0:
             pop_candidates = rng.choice(all_items_universe, size=needed * 3)
             for cand in pop_candidates:
                 if len(selected_negatives) >= n_negatives: break
+                # Deduplicate and Exclude
                 if cand not in full_history_exclusion and cand != i_id and cand not in selected_negatives:
                     selected_negatives.append(cand)
         
