@@ -303,7 +303,6 @@ We ran a `failure_analysis.py` script to inspect disagreements between the model
 * This property is crucial for sparse/long-tail recommendation, where the best item often has low global popularity.
 
 
-
 ---
 
 # 12. Cold-Start Reality
