@@ -202,14 +202,3 @@ def infer_batch(user_ids: List[int], ctx: RankingContext, model, n_candidates: i
         if (i + 1) % 1000 == 0:
             print(f"  Scored {i + 1:,}/{len(user_ids):,} users")
     return results
-
-if __name__ == "__main__":
-    if os.path.exists(INTERACTIONS_PATH) and os.path.exists(LR_MODEL_PATH):
-        interactions = pd.read_csv(INTERACTIONS_PATH)
-        # Smoke test
-        ctx = RankingContext(interactions.head(1000)) 
-        model = load_model(LR_MODEL_PATH)
-        print(f"Model loaded. Expecting {len(FEATURE_COLUMNS)} features.")
-        sample_user = interactions["user_id"].iloc[0]
-        recs = infer(sample_user, ctx, model)
-        print(f"User {sample_user} recommendations: {recs}")
