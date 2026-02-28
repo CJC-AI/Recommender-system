@@ -368,3 +368,8 @@ The goal is to understand **why the system behaves the way it does.**
 Two-stage hybrid recommender system validated. **Logistic Regression selected for deployment** after diagnostics proved XGBoost over-optimized for safety over relevance.
 
 ```
+
+## Author
+
+**Joshua Chukwuma**
+Machine Learning / AI Engineer

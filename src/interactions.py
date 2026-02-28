@@ -1,4 +1,10 @@
+import sys
 import pandas as pd
+from pathlib import Path
+
+# --- Path Resolution ---
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.append(str(BASE_DIR))
 
 
 # -----------------------------
@@ -87,4 +93,7 @@ if __name__ == "__main__":
     EVENTS_PATH = "data/raw/events.csv"
     OUTPUT_PATH = "data/processed/interactions.csv"
 
-    build_interactions(EVENTS_PATH, OUTPUT_PATH)
+    if Path(EVENTS_PATH).exists():
+        build_interactions(EVENTS_PATH, OUTPUT_PATH)
+    else:
+        print(f"Error: {EVENTS_PATH} not found")
